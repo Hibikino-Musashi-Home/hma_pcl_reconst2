@@ -2,6 +2,9 @@
 #include <memory>
 #include <string>
 #include <limits>
+#include <cstring>
+#include <stdexcept>
+#include <vector>
 
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_components/register_node_macro.hpp>
@@ -131,6 +134,65 @@ private:
 
   image_geometry::PinholeCameraModel model_;
 
+  std::vector<float> x_lut_;
+  std::vector<float> y_lut_;
+  uint32_t lut_width_ = 0;
+  uint32_t lut_height_ = 0;
+  double lut_fx_ = 0.0;
+  double lut_fy_ = 0.0;
+  double lut_cx_ = 0.0;
+  double lut_cy_ = 0.0;
+
+  void updateLookupTables(uint32_t width, uint32_t height)
+  {
+    const double fx = model_.fx();
+    const double fy = model_.fy();
+    const double cx = model_.cx();
+    const double cy = model_.cy();
+
+    if (width == lut_width_ && height == lut_height_ &&
+        fx == lut_fx_ && fy == lut_fy_ && cx == lut_cx_ && cy == lut_cy_) {
+      return;
+    }
+
+    x_lut_.resize(width);
+    y_lut_.resize(height);
+
+    for (uint32_t u = 0; u < width; ++u) {
+      x_lut_[u] = (static_cast<float>(u) - static_cast<float>(cx)) / static_cast<float>(fx);
+    }
+    for (uint32_t v = 0; v < height; ++v) {
+      y_lut_[v] = (static_cast<float>(v) - static_cast<float>(cy)) / static_cast<float>(fy);
+    }
+
+    lut_width_ = width;
+    lut_height_ = height;
+    lut_fx_ = fx;
+    lut_fy_ = fy;
+    lut_cx_ = cx;
+    lut_cy_ = cy;
+  }
+
+  static uint32_t fieldOffset(const PointCloud & cloud, const std::string & name)
+  {
+    for (const auto & field : cloud.fields) {
+      if (field.name == name) {
+        return field.offset;
+      }
+    }
+    throw std::runtime_error("PointCloud2 field not found: " + name);
+  }
+
+  static inline void writeFloat(uint8_t * point, uint32_t offset, float value)
+  {
+    std::memcpy(point + offset, &value, sizeof(value));
+  }
+
+  static inline void writeUint32(uint8_t * point, uint32_t offset, uint32_t value)
+  {
+    std::memcpy(point + offset, &value, sizeof(value));
+  }
+
   void imageCb(const sensor_msgs::msg::Image::ConstSharedPtr & depth_msg,
                const sensor_msgs::msg::Image::ConstSharedPtr & rgb_msg)
   {
@@ -209,43 +271,49 @@ private:
                const sensor_msgs::msg::Image::ConstSharedPtr & rgb_msg,
                const PointCloud::SharedPtr & cloud_msg)
   {
-    float center_x = model_.cx();
-    float center_y = model_.cy();
-    double unit_scaling = hma_pcl_reconst2::DepthTraits<T>::toMeters(T(1));
-    float constant_x = unit_scaling / model_.fx();
-    float constant_y = unit_scaling / model_.fy();
-    float bad_point = std::numeric_limits<float>::quiet_NaN();
+    const uint32_t width = cloud_msg->width;
+    const uint32_t height = cloud_msg->height;
+    updateLookupTables(width, height);
 
-    const T * depth_row = reinterpret_cast<const T *>(&depth_msg->data[0]);
-    int row_step = depth_msg->step / sizeof(T);
+    const float bad_point = std::numeric_limits<float>::quiet_NaN();
+    const T * depth_data = reinterpret_cast<const T *>(&depth_msg->data[0]);
+    const int depth_row_step = depth_msg->step / sizeof(T);
     const uint8_t * rgb_data = &rgb_msg->data[0];
-    int rgb_row_step = rgb_msg->step;  // RGB8
+    const int rgb_row_step = rgb_msg->step;
 
-    sensor_msgs::PointCloud2Iterator<float> iter_x(*cloud_msg, "x");
-    sensor_msgs::PointCloud2Iterator<float> iter_y(*cloud_msg, "y");
-    sensor_msgs::PointCloud2Iterator<float> iter_z(*cloud_msg, "z");
-    sensor_msgs::PointCloud2Iterator<float> iter_rgb(*cloud_msg, "rgb");
+    const uint32_t x_offset = fieldOffset(*cloud_msg, "x");
+    const uint32_t y_offset = fieldOffset(*cloud_msg, "y");
+    const uint32_t z_offset = fieldOffset(*cloud_msg, "z");
+    const uint32_t rgb_offset = fieldOffset(*cloud_msg, "rgb");
+    const uint32_t point_step = cloud_msg->point_step;
 
-    // TODO: optimize loop
-    for (int v = 0; v < static_cast<int>(cloud_msg->height); ++v, depth_row += row_step) {
-      const uint8_t * rgb_row = rgb_data + v * rgb_row_step;
-      for (int u = 0; u < static_cast<int>(cloud_msg->width);
-          ++u, ++iter_x, ++iter_y, ++iter_z, ++iter_rgb)
-      {
-        T depth = depth_row[u];
+    for (int v = 0; v < static_cast<int>(height); ++v) {
+      const T * depth_row = depth_data + static_cast<size_t>(v) * depth_row_step;
+      const uint8_t * rgb_row = rgb_data + static_cast<size_t>(v) * rgb_row_step;
+      uint8_t * cloud_row = cloud_msg->data.data() + static_cast<size_t>(v) * cloud_msg->row_step;
+      const float y_scale = y_lut_[v];
+
+      for (uint32_t u = 0; u < width; ++u) {
+        uint8_t * point = cloud_row + static_cast<size_t>(u) * point_step;
+        const T depth = depth_row[u];
+
         if (!hma_pcl_reconst2::DepthTraits<T>::valid(depth)) {
-          *iter_x = *iter_y = *iter_z = bad_point;
+          writeFloat(point, x_offset, bad_point);
+          writeFloat(point, y_offset, bad_point);
+          writeFloat(point, z_offset, bad_point);
         } else {
-          *iter_x = (u - center_x) * depth * constant_x;
-          *iter_y = (v - center_y) * depth * constant_y;
-          *iter_z = hma_pcl_reconst2::DepthTraits<T>::toMeters(depth);
+          const float z = hma_pcl_reconst2::DepthTraits<T>::toMeters(depth);
+          writeFloat(point, x_offset, x_lut_[u] * z);
+          writeFloat(point, y_offset, y_scale * z);
+          writeFloat(point, z_offset, z);
         }
-        const uint8_t * pixel = rgb_row + u * 3;
-        uint8_t r = pixel[0];
-        uint8_t g = pixel[1];
-        uint8_t b = pixel[2];
-        uint32_t rgb = (r << 16) | (g << 8) | b;
-        *iter_rgb = *reinterpret_cast<float *>(&rgb);
+
+        const uint8_t * pixel = rgb_row + static_cast<size_t>(u) * 3;
+        const uint32_t rgb =
+          (static_cast<uint32_t>(pixel[0]) << 16) |
+          (static_cast<uint32_t>(pixel[1]) << 8) |
+          static_cast<uint32_t>(pixel[2]);
+        writeUint32(point, rgb_offset, rgb);
       }
     }
   }
