@@ -56,6 +56,11 @@ std::string pointCloudTransportPluginName(const std::string & transport)
   return "point_cloud_transport/" + transport;
 }
 
+std::string pointCloudTransportTopic(const std::string & base_topic, const std::string & transport)
+{
+  return base_topic + "/" + transport;
+}
+
 bool stripTransportSuffix(
   const std::string & topic, const std::string & transport, std::string & base_topic)
 {
@@ -99,8 +104,6 @@ public:
     this->declare_parameter("topic_rgb", "/head_rgbd_sensor/rgb/image_rect_color");
     this->declare_parameter("topic_depth", "/head_rgbd_sensor/depth_registered/image_rect_raw");
     this->declare_parameter("topic_camera_info", "/head_rgbd_sensor/rgb/camera_info");
-    this->declare_parameter("rgb_transport", "raw");
-    this->declare_parameter("depth_transport", "raw");
     this->declare_parameter("output_topic", "/hma_pcl_reconst/depth_registered/points");
     this->declare_parameter("compressed_transport", "zstd");
     //this->declare_parameter("topic_rgb", "/head_rgbd_sensor/rgb/image_raw");
@@ -113,10 +116,8 @@ public:
     compressed_transport_ = this->get_parameter("compressed_transport").as_string();
     output_topic_ = this->get_parameter("output_topic").as_string();
 
-    const std::string default_rgb_transport =
-      use_image_compressed_ ? "compressed" : this->get_parameter("rgb_transport").as_string();
-    const std::string default_depth_transport =
-      use_image_compressed_ ? "compressedDepth" : this->get_parameter("depth_transport").as_string();
+    const std::string default_rgb_transport = use_image_compressed_ ? "compressed" : "raw";
+    const std::string default_depth_transport = use_image_compressed_ ? "compressedDepth" : "raw";
 
     const auto rgb_topic = resolveImageTopic(
       this->get_parameter("topic_rgb").as_string(),
@@ -239,10 +240,27 @@ private:
     return parameter_base_name + ".enable_pub_plugins";
   }
 
+  std::string getPointCloudTransportParameterName(
+    const std::string & topic, const std::string & transport, const std::string & parameter) const
+  {
+    auto expanded_topic = rclcpp::expand_topic_or_service_name(
+      pointCloudTransportTopic(topic, transport), this->get_name(), this->get_namespace());
+    const auto namespace_length = this->get_effective_namespace().length();
+    auto parameter_base_name = expanded_topic.substr(namespace_length);
+    std::replace(parameter_base_name.begin(), parameter_base_name.end(), '/', '.');
+    if (!parameter_base_name.empty() && parameter_base_name.front() == '.') {
+      parameter_base_name = parameter_base_name.substr(1);
+    }
+    return parameter_base_name + "." + parameter;
+  }
+
   void configurePointCloudTransportPublisher(const rclcpp::QoS & qos)
   {
     const auto plugin_name = pointCloudTransportPluginName(compressed_transport_);
     const auto enable_plugins_parameter = getPointCloudTransportPluginParameterName(output_topic_);
+    const auto zstd_encode_level_parameter =
+      getPointCloudTransportParameterName(output_topic_, compressed_transport_, "encode_level");
+    constexpr int zstd_encode_level = 1;
 
     if (!this->has_parameter(enable_plugins_parameter)) {
       this->declare_parameter<std::vector<std::string>>(
@@ -250,13 +268,33 @@ private:
     }
 
     auto node_ptr = std::shared_ptr<rclcpp::Node>(this, [](rclcpp::Node *) {});
+    try {
     pub_point_cloud_transport_ = point_cloud_transport::create_publisher(
       node_ptr, output_topic_, qos.get_rmw_qos_profile());
+
+    if (compressed_transport_ == "zstd" && this->has_parameter(zstd_encode_level_parameter)) {
+      this->set_parameter(rclcpp::Parameter(zstd_encode_level_parameter, zstd_encode_level));
+      RCLCPP_INFO(
+        this->get_logger(),
+        "Configured zstd point cloud encode_level=%d", zstd_encode_level);
+    }
 
     RCLCPP_INFO(
       this->get_logger(),
       "Publishing compressed PointCloud2 on %s/%s using %s",
-      output_topic_.c_str(), compressed_transport_.c_str(), plugin_name.c_str());
+        output_topic_.c_str(), compressed_transport_.c_str(), plugin_name.c_str());
+    } catch (const std::exception & e) {
+      use_pointcloud_compressed_ = false;
+      pub_point_cloud_ = this->create_publisher<PointCloud>(output_topic_, qos);
+      RCLCPP_ERROR(
+        this->get_logger(),
+        "Failed to create point_cloud_transport publisher with %s: %s",
+        plugin_name.c_str(), e.what());
+      RCLCPP_WARN(
+        this->get_logger(),
+        "Falling back to raw PointCloud2 on %s. Install the %s package to use compressed point clouds.",
+        output_topic_.c_str(), compressed_transport_.c_str());
+    }
   }
 
   uint32_t getPointCloudSubscriptionCount() const

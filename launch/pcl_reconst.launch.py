@@ -12,8 +12,6 @@ def generate_launch_description():
     topic_rgb = LaunchConfiguration("topic_rgb")
     topic_depth = LaunchConfiguration("topic_depth")
     topic_camera_info = LaunchConfiguration("topic_camera_info")
-    rgb_transport = LaunchConfiguration("rgb_transport")
-    depth_transport = LaunchConfiguration("depth_transport")
     output_topic = LaunchConfiguration("output_topic")
     compressed_transport = LaunchConfiguration("compressed_transport")
     use_compressed = LaunchConfiguration("use_compressed")
@@ -36,8 +34,6 @@ def generate_launch_description():
                         "topic_rgb": topic_rgb,
                         "topic_depth": topic_depth,
                         "topic_camera_info": topic_camera_info,
-                        "rgb_transport": rgb_transport,
-                        "depth_transport": depth_transport,
                         "output_topic": output_topic,
                         "compressed_transport": compressed_transport,
                         "use_compressed": ParameterValue(
@@ -59,19 +55,17 @@ def generate_launch_description():
             DeclareLaunchArgument(
                 "topic_rgb",
                 default_value="/head_rgbd_sensor/rgb/image_rect_color",
-                description="RGB image base topic. A /compressed suffix is also accepted.",
+                description="RGB image base topic.",
             ),
             DeclareLaunchArgument(
                 "topic_depth",
                 default_value="/head_rgbd_sensor/depth_registered/image_rect_raw",
-                description="Depth image base topic. A /compressedDepth suffix is also accepted.",
+                description="Depth image base topic.",
             ),
             DeclareLaunchArgument(
                 "topic_camera_info",
                 default_value="/head_rgbd_sensor/rgb/camera_info",
             ),
-            DeclareLaunchArgument("rgb_transport", default_value="raw"),
-            DeclareLaunchArgument("depth_transport", default_value="raw"),
             DeclareLaunchArgument(
                 "output_topic",
                 default_value="/hma_pcl_reconst/depth_registered/points",
