@@ -10,6 +10,7 @@ find_package(rclcpp REQUIRED)
 find_package(rclcpp_components REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(image_transport REQUIRED)
+find_package(point_cloud_transport REQUIRED)
 find_package(cv_bridge REQUIRED)
 find_package(image_geometry REQUIRED)
 find_package(depth_image_proc REQUIRED)
@@ -28,6 +29,7 @@ ament_target_dependencies(${PROJECT_NAME}
   rclcpp_components
   sensor_msgs
   image_transport
+  point_cloud_transport
   cv_bridge
   image_geometry
   depth_image_proc
@@ -49,4 +51,3 @@ install(DIRECTORY launch
   DESTINATION share/${PROJECT_NAME})
 
 ament_package()
-

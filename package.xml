@@ -14,11 +14,13 @@
   <depend>rclcpp_components</depend>
   <depend>sensor_msgs</depend>
   <depend>image_transport</depend>
+  <depend>point_cloud_transport</depend>
   <depend>cv_bridge</depend>
   <depend>image_geometry</depend>
   <depend>depth_image_proc</depend>
   <exec_depend>compressed_image_transport</exec_depend>
   <exec_depend>compressed_depth_image_transport</exec_depend>
+  <exec_depend>zstd_point_cloud_transport</exec_depend>
 
   <export>
     <build_type>ament_cmake</build_type>

@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -6,6 +7,7 @@
 #include <stdexcept>
 #include <vector>
 
+#include <rclcpp/expand_topic_or_service_name.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_components/register_node_macro.hpp>
 
@@ -15,6 +17,7 @@
 #include <message_filters/synchronizer.h>
 #include <message_filters/sync_policies/exact_time.h>
 #include <message_filters/sync_policies/approximate_time.h>
+#include <point_cloud_transport/point_cloud_transport.hpp>
 
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
@@ -44,6 +47,14 @@ struct ImageTopic
   std::string base_topic;
   std::string transport;
 };
+
+std::string pointCloudTransportPluginName(const std::string & transport)
+{
+  if (transport.find('/') != std::string::npos) {
+    return transport;
+  }
+  return "point_cloud_transport/" + transport;
+}
 
 bool stripTransportSuffix(
   const std::string & topic, const std::string & transport, std::string & base_topic)
@@ -88,18 +99,24 @@ public:
     this->declare_parameter("topic_rgb", "/head_rgbd_sensor/rgb/image_rect_color");
     this->declare_parameter("topic_depth", "/head_rgbd_sensor/depth_registered/image_rect_raw");
     this->declare_parameter("topic_camera_info", "/head_rgbd_sensor/rgb/camera_info");
+    this->declare_parameter("rgb_transport", "raw");
+    this->declare_parameter("depth_transport", "raw");
+    this->declare_parameter("output_topic", "/hma_pcl_reconst/depth_registered/points");
+    this->declare_parameter("compressed_transport", "zstd");
     //this->declare_parameter("topic_rgb", "/head_rgbd_sensor/rgb/image_raw");
     //this->declare_parameter("topic_depth", "/head_rgbd_sensor/depth_registered/image_raw");
     this->declare_parameter("use_compressed", false);
 
-    bool use_compressed = this->get_parameter("use_compressed").as_bool();
+    use_compressed_ = this->get_parameter("use_compressed").as_bool();
+    compressed_transport_ = this->get_parameter("compressed_transport").as_string();
+    output_topic_ = this->get_parameter("output_topic").as_string();
 
     const auto rgb_topic = resolveImageTopic(
       this->get_parameter("topic_rgb").as_string(),
-      use_compressed ? "compressed" : "raw");
+      this->get_parameter("rgb_transport").as_string());
     const auto depth_topic = resolveImageTopic(
       this->get_parameter("topic_depth").as_string(),
-      use_compressed ? "compressedDepth" : "raw");
+      this->get_parameter("depth_transport").as_string());
 
     topic_rgb_ = rgb_topic.base_topic;
     topic_depth_ = depth_topic.base_topic;
@@ -119,7 +136,14 @@ public:
     //rclcpp::QoS qos(10);
     auto qos = rclcpp::SensorDataQoS();
 
-    pub_point_cloud_ = this->create_publisher<PointCloud>("/hma_pcl_reconst/depth_registered/points", qos);
+    if (use_compressed_) {
+      configurePointCloudTransportPublisher(qos);
+    } else {
+      pub_point_cloud_ = this->create_publisher<PointCloud>(output_topic_, qos);
+      RCLCPP_INFO(
+        this->get_logger(),
+        "Publishing raw PointCloud2 on %s", output_topic_.c_str());
+    }
 
     if (exact_sync) {
       exact_sync_ = std::make_shared<ExactSync>(
@@ -141,7 +165,7 @@ public:
       });
 
     timer_ = this->create_wall_timer(1000ms, [this]() {
-    auto subs = pub_point_cloud_->get_subscription_count();
+    auto subs = this->getPointCloudSubscriptionCount();
     
     if (subs > 0) {
       if (!subscribed_) {
@@ -163,8 +187,10 @@ private:
 
   std::string topic_rgb_, topic_depth_, topic_camera_info_;
   std::string rgb_transport_, depth_transport_;
+  std::string output_topic_, compressed_transport_;
   rclcpp::TimerBase::SharedPtr timer_;
   bool subscribed_;
+  bool use_compressed_;
 
   using SyncPolicy = message_filters::sync_policies::ApproximateTime<
     sensor_msgs::msg::Image, sensor_msgs::msg::Image>;
@@ -179,6 +205,7 @@ private:
   std::shared_ptr<ExactSync> exact_sync_;
   rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr sub_info_;
   rclcpp::Publisher<PointCloud>::SharedPtr pub_point_cloud_;
+  point_cloud_transport::Publisher pub_point_cloud_transport_;
 
   image_geometry::PinholeCameraModel model_;
 
@@ -190,6 +217,56 @@ private:
   double lut_fy_ = 0.0;
   double lut_cx_ = 0.0;
   double lut_cy_ = 0.0;
+
+  std::string getPointCloudTransportPluginParameterName(const std::string & topic) const
+  {
+    auto expanded_topic = rclcpp::expand_topic_or_service_name(
+      topic, this->get_name(), this->get_namespace());
+    const auto namespace_length = this->get_effective_namespace().length();
+    auto parameter_base_name = expanded_topic.substr(namespace_length);
+    std::replace(parameter_base_name.begin(), parameter_base_name.end(), '/', '.');
+    if (!parameter_base_name.empty() && parameter_base_name.front() == '.') {
+      parameter_base_name = parameter_base_name.substr(1);
+    }
+    return parameter_base_name + ".enable_pub_plugins";
+  }
+
+  void configurePointCloudTransportPublisher(const rclcpp::QoS & qos)
+  {
+    const auto plugin_name = pointCloudTransportPluginName(compressed_transport_);
+    const auto enable_plugins_parameter = getPointCloudTransportPluginParameterName(output_topic_);
+
+    if (!this->has_parameter(enable_plugins_parameter)) {
+      this->declare_parameter<std::vector<std::string>>(
+        enable_plugins_parameter, std::vector<std::string>{plugin_name});
+    }
+
+    auto node_ptr = std::shared_ptr<rclcpp::Node>(this, [](rclcpp::Node *) {});
+    pub_point_cloud_transport_ = point_cloud_transport::create_publisher(
+      node_ptr, output_topic_, qos.get_rmw_qos_profile());
+
+    RCLCPP_INFO(
+      this->get_logger(),
+      "Publishing compressed PointCloud2 on %s/%s using %s",
+      output_topic_.c_str(), compressed_transport_.c_str(), plugin_name.c_str());
+  }
+
+  uint32_t getPointCloudSubscriptionCount() const
+  {
+    if (use_compressed_) {
+      return pub_point_cloud_transport_.getNumSubscribers();
+    }
+    return pub_point_cloud_ ? pub_point_cloud_->get_subscription_count() : 0;
+  }
+
+  void publishPointCloud(const PointCloud::SharedPtr & cloud_msg) const
+  {
+    if (use_compressed_) {
+      pub_point_cloud_transport_.publish(*cloud_msg);
+      return;
+    }
+    pub_point_cloud_->publish(*cloud_msg);
+  }
 
   void updateLookupTables(uint32_t width, uint32_t height)
   {
@@ -283,7 +360,7 @@ private:
       return;
     }
 
-    pub_point_cloud_->publish(*cloud_msg);
+    publishPointCloud(cloud_msg);
   }
 
   void startSubscribing()
