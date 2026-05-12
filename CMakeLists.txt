@@ -22,7 +22,12 @@ add_library(${PROJECT_NAME} SHARED
   src/pcl_xyzrgb_component.cpp
 )
 
+add_executable(pcl_transport_viewer
+  src/pcl_transport_viewer.cpp
+)
+
 target_compile_features(${PROJECT_NAME} PUBLIC cxx_std_17)
+target_compile_features(pcl_transport_viewer PUBLIC cxx_std_17)
 
 ament_target_dependencies(${PROJECT_NAME}
   rclcpp
@@ -35,14 +40,20 @@ ament_target_dependencies(${PROJECT_NAME}
   depth_image_proc
 )
 
+ament_target_dependencies(pcl_transport_viewer
+  rclcpp
+  sensor_msgs
+  point_cloud_transport
+)
+
 # register component
 rclcpp_components_register_nodes(${PROJECT_NAME}
   "hma_pcl_reconst2::PointCloudXyzrgb")
 
-install(TARGETS ${PROJECT_NAME}
+install(TARGETS ${PROJECT_NAME} pcl_transport_viewer
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
-  RUNTIME DESTINATION bin)
+  RUNTIME DESTINATION lib/${PROJECT_NAME})
 
 install(DIRECTORY include/
   DESTINATION include)

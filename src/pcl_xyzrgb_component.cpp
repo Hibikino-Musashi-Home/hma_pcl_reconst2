@@ -106,17 +106,24 @@ public:
     //this->declare_parameter("topic_rgb", "/head_rgbd_sensor/rgb/image_raw");
     //this->declare_parameter("topic_depth", "/head_rgbd_sensor/depth_registered/image_raw");
     this->declare_parameter("use_compressed", false);
+    this->declare_parameter("use_pointcloud_compressed", false);
 
-    use_compressed_ = this->get_parameter("use_compressed").as_bool();
+    use_image_compressed_ = this->get_parameter("use_compressed").as_bool();
+    use_pointcloud_compressed_ = this->get_parameter("use_pointcloud_compressed").as_bool();
     compressed_transport_ = this->get_parameter("compressed_transport").as_string();
     output_topic_ = this->get_parameter("output_topic").as_string();
 
+    const std::string default_rgb_transport =
+      use_image_compressed_ ? "compressed" : this->get_parameter("rgb_transport").as_string();
+    const std::string default_depth_transport =
+      use_image_compressed_ ? "compressedDepth" : this->get_parameter("depth_transport").as_string();
+
     const auto rgb_topic = resolveImageTopic(
       this->get_parameter("topic_rgb").as_string(),
-      this->get_parameter("rgb_transport").as_string());
+      default_rgb_transport);
     const auto depth_topic = resolveImageTopic(
       this->get_parameter("topic_depth").as_string(),
-      this->get_parameter("depth_transport").as_string());
+      default_depth_transport);
 
     topic_rgb_ = rgb_topic.base_topic;
     topic_depth_ = depth_topic.base_topic;
@@ -126,9 +133,9 @@ public:
 
     RCLCPP_INFO(
       this->get_logger(),
-      "Configured image inputs: rgb=%s (%s), depth=%s (%s), camera_info=%s",
+      "Configured image inputs: rgb=%s (%s), depth=%s (%s), camera_info=%s, compressed_input=%s",
       topic_rgb_.c_str(), rgb_transport_.c_str(), topic_depth_.c_str(), depth_transport_.c_str(),
-      topic_camera_info_.c_str());
+      topic_camera_info_.c_str(), use_image_compressed_ ? "true" : "false");
 
     int queue_size = this->get_parameter("queue_size").as_int();
     bool exact_sync = this->get_parameter("exact_sync").as_bool();
@@ -136,7 +143,7 @@ public:
     //rclcpp::QoS qos(10);
     auto qos = rclcpp::SensorDataQoS();
 
-    if (use_compressed_) {
+    if (use_pointcloud_compressed_) {
       configurePointCloudTransportPublisher(qos);
     } else {
       pub_point_cloud_ = this->create_publisher<PointCloud>(output_topic_, qos);
@@ -190,7 +197,8 @@ private:
   std::string output_topic_, compressed_transport_;
   rclcpp::TimerBase::SharedPtr timer_;
   bool subscribed_;
-  bool use_compressed_;
+  bool use_image_compressed_;
+  bool use_pointcloud_compressed_;
 
   using SyncPolicy = message_filters::sync_policies::ApproximateTime<
     sensor_msgs::msg::Image, sensor_msgs::msg::Image>;
@@ -253,7 +261,7 @@ private:
 
   uint32_t getPointCloudSubscriptionCount() const
   {
-    if (use_compressed_) {
+    if (use_pointcloud_compressed_) {
       return pub_point_cloud_transport_.getNumSubscribers();
     }
     return pub_point_cloud_ ? pub_point_cloud_->get_subscription_count() : 0;
@@ -261,7 +269,7 @@ private:
 
   void publishPointCloud(const PointCloud::SharedPtr & cloud_msg) const
   {
-    if (use_compressed_) {
+    if (use_pointcloud_compressed_) {
       pub_point_cloud_transport_.publish(*cloud_msg);
       return;
     }

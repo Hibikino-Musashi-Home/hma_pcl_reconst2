@@ -17,6 +17,7 @@ def generate_launch_description():
     output_topic = LaunchConfiguration("output_topic")
     compressed_transport = LaunchConfiguration("compressed_transport")
     use_compressed = LaunchConfiguration("use_compressed")
+    use_pointcloud_compressed = LaunchConfiguration("use_pointcloud_compressed")
 
     container = ComposableNodeContainer(
         name="cloud_reconst_container",
@@ -41,6 +42,9 @@ def generate_launch_description():
                         "compressed_transport": compressed_transport,
                         "use_compressed": ParameterValue(
                             use_compressed, value_type=bool
+                        ),
+                        "use_pointcloud_compressed": ParameterValue(
+                            use_pointcloud_compressed, value_type=bool
                         ),
                     }
                 ],
@@ -73,7 +77,8 @@ def generate_launch_description():
                 default_value="/hma_pcl_reconst/depth_registered/points",
             ),
             DeclareLaunchArgument("compressed_transport", default_value="zstd"),
-            DeclareLaunchArgument("use_compressed", default_value="true"),
+            DeclareLaunchArgument("use_compressed", default_value="false"),
+            DeclareLaunchArgument("use_pointcloud_compressed", default_value="false"),
             container,
         ]
     )
