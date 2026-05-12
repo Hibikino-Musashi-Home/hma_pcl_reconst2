@@ -36,6 +36,47 @@ using PointCloud = sensor_msgs::msg::PointCloud2;
 
 using namespace std::chrono_literals;
 
+namespace
+{
+
+struct ImageTopic
+{
+  std::string base_topic;
+  std::string transport;
+};
+
+bool stripTransportSuffix(
+  const std::string & topic, const std::string & transport, std::string & base_topic)
+{
+  const std::string suffix = "/" + transport;
+  if (topic.size() <= suffix.size()) {
+    return false;
+  }
+  if (topic.compare(topic.size() - suffix.size(), suffix.size(), suffix) != 0) {
+    return false;
+  }
+
+  base_topic = topic.substr(0, topic.size() - suffix.size());
+  return !base_topic.empty();
+}
+
+ImageTopic resolveImageTopic(
+  const std::string & requested_topic, const std::string & default_transport)
+{
+  std::string base_topic;
+  for (const auto & transport :
+    {std::string("compressedDepth"), std::string("compressed")})
+  {
+    if (stripTransportSuffix(requested_topic, transport, base_topic)) {
+      return {base_topic, transport};
+    }
+  }
+
+  return {requested_topic, default_transport};
+}
+
+}  // namespace
+
 class PointCloudXyzrgb : public rclcpp::Node
 {
 public:
@@ -46,20 +87,31 @@ public:
     this->declare_parameter("exact_sync", false);
     this->declare_parameter("topic_rgb", "/head_rgbd_sensor/rgb/image_rect_color");
     this->declare_parameter("topic_depth", "/head_rgbd_sensor/depth_registered/image_rect_raw");
+    this->declare_parameter("topic_camera_info", "/head_rgbd_sensor/rgb/camera_info");
     //this->declare_parameter("topic_rgb", "/head_rgbd_sensor/rgb/image_raw");
     //this->declare_parameter("topic_depth", "/head_rgbd_sensor/depth_registered/image_raw");
     this->declare_parameter("use_compressed", false);
 
     bool use_compressed = this->get_parameter("use_compressed").as_bool();
 
-    topic_rgb_ = this->get_parameter("topic_rgb").as_string();
-    topic_depth_ = this->get_parameter("topic_depth").as_string();
+    const auto rgb_topic = resolveImageTopic(
+      this->get_parameter("topic_rgb").as_string(),
+      use_compressed ? "compressed" : "raw");
+    const auto depth_topic = resolveImageTopic(
+      this->get_parameter("topic_depth").as_string(),
+      use_compressed ? "compressedDepth" : "raw");
 
-    rgb_transport_ = use_compressed ? "compressed" : "raw";
-    depth_transport_ = use_compressed ? "compressedDepth" : "raw";
+    topic_rgb_ = rgb_topic.base_topic;
+    topic_depth_ = depth_topic.base_topic;
+    topic_camera_info_ = this->get_parameter("topic_camera_info").as_string();
+    rgb_transport_ = rgb_topic.transport;
+    depth_transport_ = depth_topic.transport;
 
-    RCLCPP_INFO(this->get_logger(), "Configured transports: rgb=%s, depth=%s",
-      rgb_transport_.c_str(), depth_transport_.c_str());
+    RCLCPP_INFO(
+      this->get_logger(),
+      "Configured image inputs: rgb=%s (%s), depth=%s (%s), camera_info=%s",
+      topic_rgb_.c_str(), rgb_transport_.c_str(), topic_depth_.c_str(), depth_transport_.c_str(),
+      topic_camera_info_.c_str());
 
     int queue_size = this->get_parameter("queue_size").as_int();
     bool exact_sync = this->get_parameter("exact_sync").as_bool();
@@ -68,9 +120,6 @@ public:
     auto qos = rclcpp::SensorDataQoS();
 
     pub_point_cloud_ = this->create_publisher<PointCloud>("/hma_pcl_reconst/depth_registered/points", qos);
-
-    std::string rgb_transport = use_compressed ? "compressed" : "raw";
-    std::string depth_transport = use_compressed ? "compressedDepth" : "raw";
 
     if (exact_sync) {
       exact_sync_ = std::make_shared<ExactSync>(
@@ -86,7 +135,7 @@ public:
 
     //camera info
     sub_info_ = this->create_subscription<sensor_msgs::msg::CameraInfo>(
-      "/head_rgbd_sensor/rgb/camera_info", 1,
+      topic_camera_info_, 1,
       [this](sensor_msgs::msg::CameraInfo::ConstSharedPtr msg) {
         model_.fromCameraInfo(msg);
       });
@@ -112,11 +161,10 @@ public:
 
 private:
 
-  std::string topic_rgb_, topic_depth_;
+  std::string topic_rgb_, topic_depth_, topic_camera_info_;
   std::string rgb_transport_, depth_transport_;
   rclcpp::TimerBase::SharedPtr timer_;
   bool subscribed_;
-  bool use_camera_info_;
 
   using SyncPolicy = message_filters::sync_policies::ApproximateTime<
     sensor_msgs::msg::Image, sensor_msgs::msg::Image>;
@@ -243,9 +291,20 @@ private:
     if (!subscribed_) {
       RCLCPP_INFO(this->get_logger(), "Start subscribing RGB(%s) and Depth(%s)",
                   rgb_transport_.c_str(), depth_transport_.c_str());
-  
-      sub_rgb_.subscribe(this, topic_rgb_, rgb_transport_, rmw_qos_profile_sensor_data);
-      sub_depth_.subscribe(this, topic_depth_, depth_transport_, rmw_qos_profile_sensor_data);
+
+      try {
+        sub_rgb_.subscribe(this, topic_rgb_, rgb_transport_, rmw_qos_profile_sensor_data);
+        sub_depth_.subscribe(this, topic_depth_, depth_transport_, rmw_qos_profile_sensor_data);
+      } catch (const std::exception & e) {
+        sub_rgb_.unsubscribe();
+        sub_depth_.unsubscribe();
+        RCLCPP_ERROR(
+          this->get_logger(),
+          "Failed to subscribe image_transport topics. rgb=%s (%s), depth=%s (%s): %s",
+          topic_rgb_.c_str(), rgb_transport_.c_str(),
+          topic_depth_.c_str(), depth_transport_.c_str(), e.what());
+        return;
+      }
   
       if (exact_sync_) {
         exact_sync_->connectInput(sub_depth_, sub_rgb_);
