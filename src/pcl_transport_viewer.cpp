@@ -5,51 +5,15 @@
 #include <string>
 
 #include <rclcpp/rclcpp.hpp>
-#include <point_cloud_transport/point_cloud_transport.hpp>
-#include <point_cloud_transport/transport_hints.hpp>
 
 #include <sensor_msgs/msg/point_cloud2.hpp>
+
+#include "hma_pcl_reconst2/pcl_transport_decompressor.hpp"
 
 namespace
 {
 
 using PointCloud = sensor_msgs::msg::PointCloud2;
-
-struct InputTopic
-{
-  std::string base_topic;
-  std::string transport;
-};
-
-bool stripSuffix(const std::string & value, const std::string & suffix, std::string & stripped)
-{
-  if (value.size() <= suffix.size()) {
-    return false;
-  }
-  if (value.compare(value.size() - suffix.size(), suffix.size(), suffix) != 0) {
-    return false;
-  }
-  stripped = value.substr(0, value.size() - suffix.size());
-  return !stripped.empty();
-}
-
-InputTopic resolveInputTopic(const std::string & requested_topic, const std::string & transport)
-{
-  std::string base_topic;
-  if (stripSuffix(requested_topic, "/" + transport, base_topic)) {
-    return {base_topic, transport};
-  }
-
-  for (const auto & suffix : {std::string("zstd"), std::string("zlib"), std::string("draco"),
-      std::string("raw")})
-  {
-    if (stripSuffix(requested_topic, "/" + suffix, base_topic)) {
-      return {base_topic, suffix};
-    }
-  }
-
-  return {requested_topic, transport};
-}
 
 struct Stats
 {
@@ -78,21 +42,16 @@ int main(int argc, char ** argv)
   const auto output_topic = node->get_parameter("output_topic").as_string();
   const auto republish = node->get_parameter("republish").as_bool();
   const auto log_interval_sec = node->get_parameter("log_interval_sec").as_double();
-  const auto input = resolveInputTopic(requested_topic, requested_transport);
 
   auto qos = rclcpp::SensorDataQoS();
   auto pub = node->create_publisher<PointCloud>(output_topic, qos);
   auto stats = std::make_shared<Stats>();
   stats->last_log_time = node->now();
 
-  point_cloud_transport::PointCloudTransport pct(node);
-  point_cloud_transport::TransportHints hints(input.transport);
-  point_cloud_transport::Subscriber sub;
-  const std::shared_ptr<void> tracked_object;
-
+  std::unique_ptr<hma_pcl_reconst2::PointCloudTransportDecompressor> decompressor;
   try {
-    sub = pct.subscribe(
-      input.base_topic, qos.get_rmw_qos_profile(),
+    decompressor = std::make_unique<hma_pcl_reconst2::PointCloudTransportDecompressor>(
+      node, requested_topic, requested_transport, qos,
       [node, pub, stats, republish, output_topic, log_interval_sec](
         const PointCloud::ConstSharedPtr & msg)
       {
@@ -125,24 +84,24 @@ int main(int argc, char ** argv)
         stats->messages = 0;
         stats->bytes = 0;
         stats->last_log_time = now;
-      },
-      tracked_object, &hints);
+      });
   } catch (const std::exception & e) {
     RCLCPP_FATAL(
       node->get_logger(),
       "Failed to subscribe %s with point_cloud_transport=%s: %s",
-      input.base_topic.c_str(), input.transport.c_str(), e.what());
+      requested_topic.c_str(), requested_transport.c_str(), e.what());
     rclcpp::shutdown();
     return 1;
   }
 
+  const auto & input = decompressor->input();
   RCLCPP_INFO(
     node->get_logger(),
     "Subscribing %s via point_cloud_transport=%s. Decompressed output: %s",
     input.base_topic.c_str(), input.transport.c_str(), republish ? output_topic.c_str() : "off");
 
   rclcpp::spin(node);
-  sub.shutdown();
+  decompressor->shutdown();
   rclcpp::shutdown();
   return 0;
 }
