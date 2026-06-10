@@ -10,6 +10,7 @@
 #include <rclcpp/expand_topic_or_service_name.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_components/register_node_macro.hpp>
+#include <rcutils/logging.h>
 
 #include <image_transport/image_transport.hpp>
 #include <image_transport/subscriber_filter.hpp>
@@ -90,6 +91,29 @@ ImageTopic resolveImageTopic(
 
   return {requested_topic, default_transport};
 }
+
+class ScopedLoggerLevel
+{
+public:
+  ScopedLoggerLevel(const rclcpp::Logger & logger, int level)
+  : name_(logger.get_name()),
+    previous_level_(rcutils_logging_get_logger_level(name_.c_str())),
+    active_(rcutils_logging_set_logger_level(name_.c_str(), level) == RCUTILS_RET_OK)
+  {
+  }
+
+  ~ScopedLoggerLevel()
+  {
+    if (active_) {
+      rcutils_logging_set_logger_level(name_.c_str(), previous_level_);
+    }
+  }
+
+private:
+  std::string name_;
+  int previous_level_;
+  bool active_;
+};
 
 }  // namespace
 
@@ -416,6 +440,9 @@ private:
                   rgb_transport_.c_str(), depth_transport_.c_str());
 
       try {
+        // 無害なERRORログを出すため一時的にログレベルを上げる
+        ScopedLoggerLevel suppress_image_transport_fallback_error(
+          this->get_logger(), RCUTILS_LOG_SEVERITY_FATAL);
         sub_rgb_.subscribe(this, topic_rgb_, rgb_transport_, rmw_qos_profile_sensor_data);
         sub_depth_.subscribe(this, topic_depth_, depth_transport_, rmw_qos_profile_sensor_data);
       } catch (const std::exception & e) {
