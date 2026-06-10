@@ -1,8 +1,22 @@
 from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import ComposableNodeContainer
 from launch_ros.descriptions import ComposableNode
+from launch_ros.parameter_descriptions import ParameterValue
+
 
 def generate_launch_description():
+    queue_size = LaunchConfiguration("queue_size")
+    exact_sync = LaunchConfiguration("exact_sync")
+    topic_rgb = LaunchConfiguration("topic_rgb")
+    topic_depth = LaunchConfiguration("topic_depth")
+    topic_camera_info = LaunchConfiguration("topic_camera_info")
+    output_topic = LaunchConfiguration("output_topic")
+    compressed_transport = LaunchConfiguration("compressed_transport")
+    use_compressed = LaunchConfiguration("use_compressed")
+    use_pointcloud_compressed = LaunchConfiguration("use_pointcloud_compressed")
+
     container = ComposableNodeContainer(
         name="cloud_reconst_container",
         namespace="",
@@ -13,14 +27,52 @@ def generate_launch_description():
                 package="hma_pcl_reconst2",
                 plugin="hma_pcl_reconst2::PointCloudXyzrgb",
                 name="pcl_reconst",
-                parameters=[{
-                    "queue_size": 5,
-                    "exact_sync": False,
-                    "use_compressed": False,
-                }]
+                parameters=[
+                    {
+                        "queue_size": ParameterValue(queue_size, value_type=int),
+                        "exact_sync": ParameterValue(exact_sync, value_type=bool),
+                        "topic_rgb": topic_rgb,
+                        "topic_depth": topic_depth,
+                        "topic_camera_info": topic_camera_info,
+                        "output_topic": output_topic,
+                        "compressed_transport": compressed_transport,
+                        "use_compressed": ParameterValue(
+                            use_compressed, value_type=bool
+                        ),
+                        "use_pointcloud_compressed": ParameterValue(
+                            use_pointcloud_compressed, value_type=bool
+                        ),
+                    }
+                ],
             )
         ],
-        output="screen"
+        output="screen",
     )
-    return LaunchDescription([container])
-
+    return LaunchDescription(
+        [
+            DeclareLaunchArgument("queue_size", default_value="5"),
+            DeclareLaunchArgument("exact_sync", default_value="false"),
+            DeclareLaunchArgument(
+                "topic_rgb",
+                default_value="/head_rgbd_sensor/rgb/image_rect_color",
+                description="RGB image base topic.",
+            ),
+            DeclareLaunchArgument(
+                "topic_depth",
+                default_value="/head_rgbd_sensor/depth_registered/image_rect_raw",
+                description="Depth image base topic.",
+            ),
+            DeclareLaunchArgument(
+                "topic_camera_info",
+                default_value="/head_rgbd_sensor/rgb/camera_info",
+            ),
+            DeclareLaunchArgument(
+                "output_topic",
+                default_value="/hma_pcl_reconst/depth_registered/points",
+            ),
+            DeclareLaunchArgument("compressed_transport", default_value="zstd"),
+            DeclareLaunchArgument("use_compressed", default_value="false"),
+            DeclareLaunchArgument("use_pointcloud_compressed", default_value="false"),
+            container,
+        ]
+    )
