@@ -64,6 +64,23 @@ ros2 launch hma_pcl_reconst2 pcl_reconst.launch.py \
   use_pointcloud_compressed:=true
 ```
 
+シミュレーション (`USE_SIM_TIME=true`):
+
+`pcl_reconst.launch.py`は環境変数`USE_SIM_TIME`を見て入力topicのデフォルトを切り替えます。
+`USE_SIM_TIME=true`のときはGazebo用の`/head_camera/...`をcompressedで受け取り、
+それ以外のときは実機の`/head_rgbd_sensor/...`をrawで受け取ります。
+
+```bash
+USE_SIM_TIME=true ros2 launch hma_pcl_reconst2 pcl_reconst.launch.py
+```
+
+| `USE_SIM_TIME` | `topic_rgb`                              | `topic_depth`                                       | `topic_camera_info`                 | `use_compressed` |
+| -------------- | ---------------------------------------- | --------------------------------------------------- | ----------------------------------- | ---------------- |
+| `true`         | `/head_camera/color/image_rect_raw`      | `/head_camera/depth/image_rect_raw`                 | `/head_camera/color/camera_info`    | `true`           |
+| その他         | `/head_rgbd_sensor/rgb/image_rect_color` | `/head_rgbd_sensor/depth_registered/image_rect_raw` | `/head_rgbd_sensor/rgb/camera_info` | `false`          |
+
+各引数はコマンドライン (`topic_rgb:=...`など) で従来どおり上書きできます。
+
 圧縮点群を解凍してRVizなどで見る:
 
 ```bash
@@ -77,17 +94,21 @@ ros2 launch hma_pcl_reconst2 pcl_transport_viewer.launch.py
 
 `pcl_reconst.launch.py`:
 
-| Name | Default | Description |
-| --- | --- | --- |
-| `topic_rgb` | `/head_rgbd_sensor/rgb/image_rect_color` | RGB image base topic |
-| `topic_depth` | `/head_rgbd_sensor/depth_registered/image_rect_raw` | Depth image base topic |
-| `topic_camera_info` | `/head_rgbd_sensor/rgb/camera_info` | Camera info topic |
-| `output_topic` | `/hma_pcl_reconst/depth_registered/points` | Output point cloud base topic |
-| `use_compressed` | `false` | Subscribe RGB as `compressed` and depth as `compressedDepth` |
-| `use_pointcloud_compressed` | `false` | Publish through `point_cloud_transport` |
-| `compressed_transport` | `zstd` | Point cloud transport name |
-| `queue_size` | `5` | Sync queue size |
-| `exact_sync` | `false` | Use exact timestamp sync |
+| Name                        | Default                                             | Description                                                  |
+| --------------------------- | --------------------------------------------------- | ------------------------------------------------------------ |
+| `topic_rgb`                 | `/head_rgbd_sensor/rgb/image_rect_color`            | RGB image base topic                                         |
+| `topic_depth`               | `/head_rgbd_sensor/depth_registered/image_rect_raw` | Depth image base topic                                       |
+| `topic_camera_info`         | `/head_rgbd_sensor/rgb/camera_info`                 | Camera info topic                                            |
+| `output_topic`              | `/hma_pcl_reconst/depth_registered/points`          | Output point cloud base topic                                |
+| `use_compressed`            | `false`                                             | Subscribe RGB as `compressed` and depth as `compressedDepth` |
+| `use_pointcloud_compressed` | `false`                                             | Publish through `point_cloud_transport`                      |
+| `compressed_transport`      | `zstd`                                              | Point cloud transport name                                   |
+| `queue_size`                | `5`                                                 | Sync queue size                                              |
+| `exact_sync`                | `false`                                             | Use exact timestamp sync                                     |
+| `use_sim_time`              | `$USE_SIM_TIME` (既定`false`)                       | Use simulation clock                                         |
+
+`topic_rgb` / `topic_depth` / `topic_camera_info` / `use_compressed`のデフォルトは
+環境変数`USE_SIM_TIME`で切り替わります（上記「シミュレーション」を参照）。表の値は実機 (`USE_SIM_TIME`未設定) のときの値です。
 
 ## C++ Decompressor Helper
 
@@ -111,7 +132,7 @@ auto decompressor =
 
 ## Notes
 
-- RGBとdepthは同じ解像度・同じ座標系に揃えたtopicを使ってください。
+- RGBとdepthは同じ解像度・同じ座標系に揃えたtopicを使ってください。(registrationされたもの)
   RealSenseでは`/camera/aligned_depth_to_color/image_raw`が候補です。
 - 1280x720のorganized XYZRGB点群はrawで約29.5MB/frameになります。
   30Hzを狙う場合、圧縮率だけでなく解像度や点数削減も検討してください。
