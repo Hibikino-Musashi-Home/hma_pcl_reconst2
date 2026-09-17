@@ -1,34 +1,35 @@
-import os
-
 from launch_ros.actions import ComposableNodeContainer
 from launch_ros.descriptions import ComposableNode
 from launch_ros.parameter_descriptions import ParameterValue
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
-from launch.substitutions import LaunchConfiguration
+from launch.actions import DeclareLaunchArgument, OpaqueFunction
+from launch.conditions import IfCondition
+from launch.substitutions import EnvironmentVariable, LaunchConfiguration
+
+# Default input topics per mode. Explicit launch arguments always take precedence.
+SIM_TOPICS = {
+    'topic_rgb': '/head_rgbd_sensor/rgb/image_rect_raw',
+    'topic_depth': '/head_rgbd_sensor/depth_registered/image_rect_raw',
+    'topic_camera_info': '/head_rgbd_sensor/rgb/camera_info',
+}
+REAL_TOPICS = {
+    'topic_rgb': '/head_rgbd_sensor/rgb/image_rect_color',
+    'topic_depth': '/head_rgbd_sensor/depth_registered/image_rect_raw',
+    'topic_camera_info': '/head_rgbd_sensor/rgb/camera_info',
+}
 
 
-def generate_launch_description():
-    use_sim = os.getenv('USE_SIM_TIME', 'false')
+def launch_setup(context):
+    use_sim_time = IfCondition(LaunchConfiguration('use_sim_time')).evaluate(context)
+    default_topics = SIM_TOPICS if use_sim_time else REAL_TOPICS
 
-    if use_sim:
-        default_topic_rgb = '/head_rgbd_sensor/rgb/image_rect_raw'
-        default_topic_depth = '/head_rgbd_sensor/depth_registered/image_rect_raw'
-        default_topic_camera_info = '/head_rgbd_sensor/rgb/camera_info'
-        default_use_compressed = 'true'
-    else:
-        default_topic_rgb = '/head_rgbd_sensor/rgb/image_rect_color'
-        default_topic_depth = '/head_rgbd_sensor/depth_registered/image_rect_raw'
-        default_topic_camera_info = '/head_rgbd_sensor/rgb/camera_info'
-        default_use_compressed = 'false'
+    def topic_or_default(name):
+        value = LaunchConfiguration(name).perform(context)
+        return value if value != '' else default_topics[name]
 
-    use_sim_time = LaunchConfiguration('use_sim_time')
     queue_size = LaunchConfiguration('queue_size')
     exact_sync = LaunchConfiguration('exact_sync')
-    topic_rgb = LaunchConfiguration('topic_rgb')
-    topic_depth = LaunchConfiguration('topic_depth')
-    topic_camera_info = LaunchConfiguration('topic_camera_info')
     output_topic = LaunchConfiguration('output_topic')
     compressed_transport = LaunchConfiguration('compressed_transport')
     use_compressed = LaunchConfiguration('use_compressed')
@@ -47,12 +48,12 @@ def generate_launch_description():
                 name='pcl_reconst',
                 parameters=[
                     {
-                        'use_sim_time': ParameterValue(use_sim_time, value_type=bool),
+                        'use_sim_time': use_sim_time,
                         'queue_size': ParameterValue(queue_size, value_type=int),
                         'exact_sync': ParameterValue(exact_sync, value_type=bool),
-                        'topic_rgb': topic_rgb,
-                        'topic_depth': topic_depth,
-                        'topic_camera_info': topic_camera_info,
+                        'topic_rgb': topic_or_default('topic_rgb'),
+                        'topic_depth': topic_or_default('topic_depth'),
+                        'topic_camera_info': topic_or_default('topic_camera_info'),
                         'output_topic': output_topic,
                         'compressed_transport': compressed_transport,
                         'use_compressed': ParameterValue(use_compressed, value_type=bool),
@@ -65,27 +66,33 @@ def generate_launch_description():
         ],
         output='screen',
     )
+    return [container]
+
+
+def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument(
             'use_sim_time',
-            default_value='true' if use_sim else 'false',
-            description='Use the simulation clock. Defaults to the USE_SIM_TIME env var.',
+            default_value=EnvironmentVariable('USE_SIM_TIME', default_value='false'),
+            description='Use the simulation clock and sim input topic defaults. '
+                        'Defaults to the USE_SIM_TIME env var.',
         ),
         DeclareLaunchArgument('queue_size', default_value='5'),
         DeclareLaunchArgument('exact_sync', default_value='false'),
         DeclareLaunchArgument(
             'topic_rgb',
-            default_value=default_topic_rgb,
-            description='RGB image base topic.',
+            default_value='',
+            description='RGB image base topic. Empty selects the default for use_sim_time.',
         ),
         DeclareLaunchArgument(
             'topic_depth',
-            default_value=default_topic_depth,
-            description='Depth image base topic.',
+            default_value='',
+            description='Depth image base topic. Empty selects the default for use_sim_time.',
         ),
         DeclareLaunchArgument(
             'topic_camera_info',
-            default_value=default_topic_camera_info,
+            default_value='',
+            description='Camera info topic. Empty selects the default for use_sim_time.',
         ),
         DeclareLaunchArgument(
             'output_topic',
@@ -93,8 +100,11 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument('compressed_transport', default_value='zstd'),
         DeclareLaunchArgument(
-            'use_compressed', default_value=default_use_compressed),
+            'use_compressed',
+            default_value='false',
+            description='Subscribe compressed images.',
+        ),
         DeclareLaunchArgument('use_pointcloud_compressed',
                               default_value='false'),
-        container,
+        OpaqueFunction(function=launch_setup),
     ])

@@ -1,40 +1,45 @@
 # hma_pcl_reconst2
 
-RGB image + depth image + camera infoから、XYZRGBの`PointCloud2`を生成するROS 2パッケージです。
-入力画像はrawまたは`image_transport`の`compressed` / `compressedDepth`を使えます。
-出力点群はraw `PointCloud2`または`point_cloud_transport`の圧縮transportでpublishできます。
+A ROS 2 (Jazzy) package that builds an XYZRGB `PointCloud2` from an RGB image, a depth image, and camera info.
+Input images can be raw, or `compressed` / `compressedDepth` via `image_transport`.
+The output point cloud can be published as a raw `PointCloud2`, or through a compressed `point_cloud_transport` transport.
+
+The package provides:
+
+- `hma_pcl_reconst2::PointCloudXyzrgb`: a composable node that reconstructs the point cloud
+- `pcl_transport_viewer`: a node that decompresses a compressed point cloud and republishes it as a raw one
+- `hma_pcl_reconst2/pcl_transport_decompressor.hpp`: a header-only helper for subscribing to compressed point clouds from C++
 
 ## Install
 
-依存パッケージを用意します。
+Install the dependencies:
 
 ```bash
 sudo apt install \
-  ros-humble-image-transport \
-  ros-humble-compressed-image-transport \
-  ros-humble-compressed-depth-image-transport \
-  ros-humble-point-cloud-transport
+  ros-jazzy-image-transport \
+  ros-jazzy-compressed-image-transport \
+  ros-jazzy-compressed-depth-image-transport \
+  ros-jazzy-point-cloud-transport \
+  ros-jazzy-zstd-point-cloud-transport
 ```
 
-`use_pointcloud_compressed:=true`で`zstd`を使う場合は、`zstd_point_cloud_transport`も環境に入れてください。
+To check that the `zstd` transport is available, run:
 
 ```bash
 ros2 pkg prefix zstd_point_cloud_transport
 ```
 
-が通ればOKです。
-
-ビルド:
+Build:
 
 ```bash
-cd ~/hma2_ws
+cd /hsr_ros2_ws
 colcon build --packages-select hma_pcl_reconst2 --symlink-install
 source install/setup.bash
 ```
 
 ## Usage
 
-raw画像入力、raw点群出力:
+### Raw image input, raw point cloud output
 
 ```bash
 ros2 launch hma_pcl_reconst2 pcl_reconst.launch.py \
@@ -43,7 +48,7 @@ ros2 launch hma_pcl_reconst2 pcl_reconst.launch.py \
   topic_camera_info:=/camera/color/camera_info
 ```
 
-圧縮画像入力:
+### Compressed image input
 
 ```bash
 ros2 launch hma_pcl_reconst2 pcl_reconst.launch.py \
@@ -53,7 +58,9 @@ ros2 launch hma_pcl_reconst2 pcl_reconst.launch.py \
   use_compressed:=true
 ```
 
-圧縮点群出力:
+With `use_compressed:=true`, the RGB image is subscribed with the `compressed` transport and the depth image with `compressedDepth`. Pass the base topic, without the transport suffix.
+
+### Compressed point cloud output
 
 ```bash
 ros2 launch hma_pcl_reconst2 pcl_reconst.launch.py \
@@ -64,55 +71,75 @@ ros2 launch hma_pcl_reconst2 pcl_reconst.launch.py \
   use_pointcloud_compressed:=true
 ```
 
-シミュレーション (`USE_SIM_TIME=true`):
+The compressed cloud is published on `<output_topic>/<compressed_transport>`, which is `/hma_pcl_reconst/depth_registered/points/zstd` by default.
 
-`pcl_reconst.launch.py`は環境変数`USE_SIM_TIME`を見て入力topicのデフォルトを切り替えます。
-`USE_SIM_TIME=true`のときはGazebo用の`/head_camera/...`をcompressedで受け取り、
-それ以外のときは実機の`/head_rgbd_sensor/...`をrawで受け取ります。
+### Simulation (`use_sim_time`)
+
+`pcl_reconst.launch.py` picks its default input topics based on `use_sim_time`.
+
+- The `use_sim_time` argument defaults to the `USE_SIM_TIME` environment variable. The values `true`, `1`, `yes`, and `on` enable it.
+- With `use_sim_time:=true`, the node subscribes to the simulator topics (`hsrb_gazebo_bringup`). Otherwise, it subscribes to the real robot topics.
+- Only the input topics change. To subscribe to compressed images, you still have to set `use_compressed:=true`.
 
 ```bash
 USE_SIM_TIME=true ros2 launch hma_pcl_reconst2 pcl_reconst.launch.py
+# or
+ros2 launch hma_pcl_reconst2 pcl_reconst.launch.py use_sim_time:=true
 ```
 
-| `USE_SIM_TIME` | `topic_rgb`                              | `topic_depth`                                       | `topic_camera_info`                 | `use_compressed` |
-| -------------- | ---------------------------------------- | --------------------------------------------------- | ----------------------------------- | ---------------- |
-| `true`         | `/head_camera/color/image_rect_raw`      | `/head_camera/depth/image_rect_raw`                 | `/head_camera/color/camera_info`    | `true`           |
-| その他         | `/head_rgbd_sensor/rgb/image_rect_color` | `/head_rgbd_sensor/depth_registered/image_rect_raw` | `/head_rgbd_sensor/rgb/camera_info` | `false`          |
+| `use_sim_time` | `topic_rgb`                              | `topic_depth`                                       | `topic_camera_info`                 |
+| -------------- | ---------------------------------------- | --------------------------------------------------- | ----------------------------------- |
+| `true`         | `/head_rgbd_sensor/rgb/image_rect_raw`   | `/head_rgbd_sensor/depth_registered/image_rect_raw` | `/head_rgbd_sensor/rgb/camera_info` |
+| `false`        | `/head_rgbd_sensor/rgb/image_rect_color` | `/head_rgbd_sensor/depth_registered/image_rect_raw` | `/head_rgbd_sensor/rgb/camera_info` |
 
-各引数はコマンドライン (`topic_rgb:=...`など) で従来どおり上書きできます。
+You can still override any of these on the command line, for example with `topic_rgb:=...`.
 
-圧縮点群を解凍してRVizなどで見る:
+### Viewing a compressed point cloud
+
+To decompress the point cloud and view it in RViz or another tool:
 
 ```bash
 ros2 launch hma_pcl_reconst2 pcl_transport_viewer.launch.py
 ```
 
-デフォルトでは`/hma_pcl_reconst/depth_registered/points/zstd`を購読し、
-解凍したraw `PointCloud2`を`/hma_pcl_reconst/depth_registered/points/zstd_decompressed`に再publishします。
+By default, the viewer subscribes to `/hma_pcl_reconst/depth_registered/points/zstd`
+and republishes the decompressed raw `PointCloud2` on `/hma_pcl_reconst/depth_registered/points/zstd_decompressed`.
+The viewer also accepts a `use_sim_time` argument, which defaults to the `USE_SIM_TIME` environment variable. It does not change the viewer's topics.
 
 ## Parameters
 
-`pcl_reconst.launch.py`:
+### `pcl_reconst.launch.py`
 
-| Name                        | Default                                             | Description                                                  |
-| --------------------------- | --------------------------------------------------- | ------------------------------------------------------------ |
-| `topic_rgb`                 | `/head_rgbd_sensor/rgb/image_rect_color`            | RGB image base topic                                         |
-| `topic_depth`               | `/head_rgbd_sensor/depth_registered/image_rect_raw` | Depth image base topic                                       |
-| `topic_camera_info`         | `/head_rgbd_sensor/rgb/camera_info`                 | Camera info topic                                            |
-| `output_topic`              | `/hma_pcl_reconst/depth_registered/points`          | Output point cloud base topic                                |
-| `use_compressed`            | `false`                                             | Subscribe RGB as `compressed` and depth as `compressedDepth` |
-| `use_pointcloud_compressed` | `false`                                             | Publish through `point_cloud_transport`                      |
-| `compressed_transport`      | `zstd`                                              | Point cloud transport name                                   |
-| `queue_size`                | `5`                                                 | Sync queue size                                              |
-| `exact_sync`                | `false`                                             | Use exact timestamp sync                                     |
-| `use_sim_time`              | `$USE_SIM_TIME` (既定`false`)                       | Use simulation clock                                         |
+| Name                        | Default                                             | Description                                                     |
+| --------------------------- | --------------------------------------------------- | --------------------------------------------------------------- |
+| `topic_rgb`                 | `/head_rgbd_sensor/rgb/image_rect_color`            | RGB image base topic                                            |
+| `topic_depth`               | `/head_rgbd_sensor/depth_registered/image_rect_raw` | Depth image base topic                                          |
+| `topic_camera_info`         | `/head_rgbd_sensor/rgb/camera_info`                 | Camera info topic                                               |
+| `output_topic`              | `/hma_pcl_reconst/depth_registered/points`          | Output point cloud base topic                                   |
+| `use_compressed`            | `false`                                             | Subscribe to RGB as `compressed` and depth as `compressedDepth` |
+| `use_pointcloud_compressed` | `false`                                             | Publish through `point_cloud_transport`                         |
+| `compressed_transport`      | `zstd`                                              | Point cloud transport name                                      |
+| `queue_size`                | `5`                                                 | Sync queue size                                                 |
+| `exact_sync`                | `false`                                             | Use exact timestamp sync instead of approximate sync            |
+| `use_sim_time`              | `$USE_SIM_TIME` (`false` if unset)                  | Use the simulation clock and the simulation input topics        |
 
-`topic_rgb` / `topic_depth` / `topic_camera_info` / `use_compressed`のデフォルトは
-環境変数`USE_SIM_TIME`で切り替わります（上記「シミュレーション」を参照）。表の値は実機 (`USE_SIM_TIME`未設定) のときの値です。
+The defaults of `topic_rgb`, `topic_depth`, and `topic_camera_info` depend on `use_sim_time` (see [Simulation](#simulation-use_sim_time)).
+The table shows the values for the real robot (`use_sim_time:=false`).
+
+### `pcl_transport_viewer.launch.py`
+
+| Name               | Default                                                      | Description                                            |
+| ------------------ | ------------------------------------------------------------ | ------------------------------------------------------ |
+| `input_topic`      | `/hma_pcl_reconst/depth_registered/points/zstd`              | Compressed transport topic, or the base topic          |
+| `output_topic`     | `/hma_pcl_reconst/depth_registered/points/zstd_decompressed` | Raw `PointCloud2` topic for the decompressed clouds    |
+| `transport`        | `zstd`                                                       | `point_cloud_transport` subscriber transport           |
+| `republish`        | `true`                                                       | Republish the decompressed clouds as raw `PointCloud2` |
+| `log_interval_sec` | `1.0`                                                        | Interval between terminal status logs, in seconds      |
+| `use_sim_time`     | `$USE_SIM_TIME` (`false` if unset)                           | Use the simulation clock                               |
 
 ## C++ Decompressor Helper
 
-圧縮された`point_cloud_transport`の点群を、ほかのノードから簡単に購読するためのヘッダを用意しています。
+`pcl_transport_decompressor.hpp` lets other nodes subscribe to a compressed `point_cloud_transport` point cloud with a few lines of code:
 
 ```cpp
 #include "hma_pcl_reconst2/pcl_transport_decompressor.hpp"
@@ -124,15 +151,23 @@ auto decompressor =
     "zstd",
     rclcpp::SensorDataQoS(),
     [](const sensor_msgs::msg::PointCloud2::ConstSharedPtr & msg) {
-      // msg is already decompressed PointCloud2.
+      // msg is already a decompressed PointCloud2.
     });
 ```
 
-`input_topic`にはbase topicでも、`/zstd`などのtransport suffix付きtopicでも渡せます。
+`input_topic` accepts either the base topic or a topic with a transport suffix such as `/zstd`.
 
 ## Notes
 
-- RGBとdepthは同じ解像度・同じ座標系に揃えたtopicを使ってください。(registrationされたもの)
-  RealSenseでは`/camera/aligned_depth_to_color/image_raw`が候補です。
-- 1280x720のorganized XYZRGB点群はrawで約29.5MB/frameになります。
-  30Hzを狙う場合、圧縮率だけでなく解像度や点数削減も検討してください。
+- The RGB and depth topics must have the same resolution and the same frame, that is, the depth image must be registered to the RGB image.
+  On a RealSense camera, `/camera/aligned_depth_to_color/image_raw` is a suitable depth topic.
+- A 1280x720 organized XYZRGB point cloud is about 29.5 MB per frame when raw.
+  To reach 30 Hz, consider lowering the resolution or the number of points as well as compressing the cloud.
+
+## Author
+
+- Ryohei Kobayashi (<kobayashi.ryohei621@mail.kyutech.jp>)
+
+## License
+
+This package is licensed under the [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0).

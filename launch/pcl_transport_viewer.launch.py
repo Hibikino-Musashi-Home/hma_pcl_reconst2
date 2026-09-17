@@ -1,11 +1,12 @@
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import EnvironmentVariable, LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
+    use_sim_time = LaunchConfiguration("use_sim_time")
     input_topic = LaunchConfiguration("input_topic")
     output_topic = LaunchConfiguration("output_topic")
     transport = LaunchConfiguration("transport")
@@ -18,6 +19,7 @@ def generate_launch_description():
         name="pcl_transport_viewer",
         output="screen",
         parameters=[{
+            "use_sim_time": ParameterValue(use_sim_time, value_type=bool),
             "input_topic": input_topic,
             "output_topic": output_topic,
             "transport": transport,
@@ -27,6 +29,11 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        DeclareLaunchArgument(
+            "use_sim_time",
+            default_value=EnvironmentVariable("USE_SIM_TIME", default_value="false"),
+            description="Use the simulation clock. Defaults to the USE_SIM_TIME env var.",
+        ),
         DeclareLaunchArgument(
             "input_topic",
             default_value="/hma_pcl_reconst/depth_registered/points/zstd",
