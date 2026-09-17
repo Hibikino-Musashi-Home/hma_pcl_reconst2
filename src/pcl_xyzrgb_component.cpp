@@ -1,8 +1,13 @@
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <limits>
+#include <cstring>
+#include <stdexcept>
+#include <vector>
 
+#include <rclcpp/expand_topic_or_service_name.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_components/register_node_macro.hpp>
 
@@ -12,6 +17,7 @@
 #include <message_filters/synchronizer.h>
 #include <message_filters/sync_policies/exact_time.h>
 #include <message_filters/sync_policies/approximate_time.h>
+#include <point_cloud_transport/point_cloud_transport.hpp>
 
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
@@ -33,6 +39,60 @@ using PointCloud = sensor_msgs::msg::PointCloud2;
 
 using namespace std::chrono_literals;
 
+namespace
+{
+
+struct ImageTopic
+{
+  std::string base_topic;
+  std::string transport;
+};
+
+std::string pointCloudTransportPluginName(const std::string & transport)
+{
+  if (transport.find('/') != std::string::npos) {
+    return transport;
+  }
+  return "point_cloud_transport/" + transport;
+}
+
+std::string pointCloudTransportTopic(const std::string & base_topic, const std::string & transport)
+{
+  return base_topic + "/" + transport;
+}
+
+bool stripTransportSuffix(
+  const std::string & topic, const std::string & transport, std::string & base_topic)
+{
+  const std::string suffix = "/" + transport;
+  if (topic.size() <= suffix.size()) {
+    return false;
+  }
+  if (topic.compare(topic.size() - suffix.size(), suffix.size(), suffix) != 0) {
+    return false;
+  }
+
+  base_topic = topic.substr(0, topic.size() - suffix.size());
+  return !base_topic.empty();
+}
+
+ImageTopic resolveImageTopic(
+  const std::string & requested_topic, const std::string & default_transport)
+{
+  std::string base_topic;
+  for (const auto & transport :
+    {std::string("compressedDepth"), std::string("compressed")})
+  {
+    if (stripTransportSuffix(requested_topic, transport, base_topic)) {
+      return {base_topic, transport};
+    }
+  }
+
+  return {requested_topic, default_transport};
+}
+
+}  // namespace
+
 class PointCloudXyzrgb : public rclcpp::Node
 {
 public:
@@ -43,20 +103,40 @@ public:
     this->declare_parameter("exact_sync", false);
     this->declare_parameter("topic_rgb", "/head_rgbd_sensor/rgb/image_rect_color");
     this->declare_parameter("topic_depth", "/head_rgbd_sensor/depth_registered/image_rect_raw");
+    this->declare_parameter("topic_camera_info", "/head_rgbd_sensor/rgb/camera_info");
+    this->declare_parameter("output_topic", "/hma_pcl_reconst/depth_registered/points");
+    this->declare_parameter("compressed_transport", "zstd");
     //this->declare_parameter("topic_rgb", "/head_rgbd_sensor/rgb/image_raw");
     //this->declare_parameter("topic_depth", "/head_rgbd_sensor/depth_registered/image_raw");
     this->declare_parameter("use_compressed", false);
+    this->declare_parameter("use_pointcloud_compressed", false);
 
-    bool use_compressed = this->get_parameter("use_compressed").as_bool();
+    use_image_compressed_ = this->get_parameter("use_compressed").as_bool();
+    use_pointcloud_compressed_ = this->get_parameter("use_pointcloud_compressed").as_bool();
+    compressed_transport_ = this->get_parameter("compressed_transport").as_string();
+    output_topic_ = this->get_parameter("output_topic").as_string();
 
-    topic_rgb_ = this->get_parameter("topic_rgb").as_string();
-    topic_depth_ = this->get_parameter("topic_depth").as_string();
+    const std::string default_rgb_transport = use_image_compressed_ ? "compressed" : "raw";
+    const std::string default_depth_transport = use_image_compressed_ ? "compressedDepth" : "raw";
 
-    rgb_transport_ = use_compressed ? "compressed" : "raw";
-    depth_transport_ = use_compressed ? "compressedDepth" : "raw";
+    const auto rgb_topic = resolveImageTopic(
+      this->get_parameter("topic_rgb").as_string(),
+      default_rgb_transport);
+    const auto depth_topic = resolveImageTopic(
+      this->get_parameter("topic_depth").as_string(),
+      default_depth_transport);
 
-    RCLCPP_INFO(this->get_logger(), "Configured transports: rgb=%s, depth=%s",
-      rgb_transport_.c_str(), depth_transport_.c_str());
+    topic_rgb_ = rgb_topic.base_topic;
+    topic_depth_ = depth_topic.base_topic;
+    topic_camera_info_ = this->get_parameter("topic_camera_info").as_string();
+    rgb_transport_ = rgb_topic.transport;
+    depth_transport_ = depth_topic.transport;
+
+    RCLCPP_INFO(
+      this->get_logger(),
+      "Configured image inputs: rgb=%s (%s), depth=%s (%s), camera_info=%s, compressed_input=%s",
+      topic_rgb_.c_str(), rgb_transport_.c_str(), topic_depth_.c_str(), depth_transport_.c_str(),
+      topic_camera_info_.c_str(), use_image_compressed_ ? "true" : "false");
 
     int queue_size = this->get_parameter("queue_size").as_int();
     bool exact_sync = this->get_parameter("exact_sync").as_bool();
@@ -64,10 +144,14 @@ public:
     //rclcpp::QoS qos(10);
     auto qos = rclcpp::SensorDataQoS();
 
-    pub_point_cloud_ = this->create_publisher<PointCloud>("/hma_pcl_reconst/depth_registered/points", qos);
-
-    std::string rgb_transport = use_compressed ? "compressed" : "raw";
-    std::string depth_transport = use_compressed ? "compressedDepth" : "raw";
+    if (use_pointcloud_compressed_) {
+      configurePointCloudTransportPublisher(qos);
+    } else {
+      pub_point_cloud_ = this->create_publisher<PointCloud>(output_topic_, qos);
+      RCLCPP_INFO(
+        this->get_logger(),
+        "Publishing raw PointCloud2 on %s", output_topic_.c_str());
+    }
 
     if (exact_sync) {
       exact_sync_ = std::make_shared<ExactSync>(
@@ -83,13 +167,13 @@ public:
 
     //camera info
     sub_info_ = this->create_subscription<sensor_msgs::msg::CameraInfo>(
-      "/head_rgbd_sensor/rgb/camera_info", 1,
+      topic_camera_info_, 1,
       [this](sensor_msgs::msg::CameraInfo::ConstSharedPtr msg) {
         model_.fromCameraInfo(msg);
       });
 
     timer_ = this->create_wall_timer(1000ms, [this]() {
-    auto subs = pub_point_cloud_->get_subscription_count();
+    auto subs = this->getPointCloudSubscriptionCount();
     
     if (subs > 0) {
       if (!subscribed_) {
@@ -109,11 +193,13 @@ public:
 
 private:
 
-  std::string topic_rgb_, topic_depth_;
+  std::string topic_rgb_, topic_depth_, topic_camera_info_;
   std::string rgb_transport_, depth_transport_;
+  std::string output_topic_, compressed_transport_;
   rclcpp::TimerBase::SharedPtr timer_;
   bool subscribed_;
-  bool use_camera_info_;
+  bool use_image_compressed_;
+  bool use_pointcloud_compressed_;
 
   using SyncPolicy = message_filters::sync_policies::ApproximateTime<
     sensor_msgs::msg::Image, sensor_msgs::msg::Image>;
@@ -128,8 +214,155 @@ private:
   std::shared_ptr<ExactSync> exact_sync_;
   rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr sub_info_;
   rclcpp::Publisher<PointCloud>::SharedPtr pub_point_cloud_;
+  point_cloud_transport::Publisher pub_point_cloud_transport_;
 
   image_geometry::PinholeCameraModel model_;
+
+  std::vector<float> x_lut_;
+  std::vector<float> y_lut_;
+  uint32_t lut_width_ = 0;
+  uint32_t lut_height_ = 0;
+  double lut_fx_ = 0.0;
+  double lut_fy_ = 0.0;
+  double lut_cx_ = 0.0;
+  double lut_cy_ = 0.0;
+
+  std::string getPointCloudTransportPluginParameterName(const std::string & topic) const
+  {
+    auto expanded_topic = rclcpp::expand_topic_or_service_name(
+      topic, this->get_name(), this->get_namespace());
+    const auto namespace_length = this->get_effective_namespace().length();
+    auto parameter_base_name = expanded_topic.substr(namespace_length);
+    std::replace(parameter_base_name.begin(), parameter_base_name.end(), '/', '.');
+    if (!parameter_base_name.empty() && parameter_base_name.front() == '.') {
+      parameter_base_name = parameter_base_name.substr(1);
+    }
+    return parameter_base_name + ".enable_pub_plugins";
+  }
+
+  std::string getPointCloudTransportParameterName(
+    const std::string & topic, const std::string & transport, const std::string & parameter) const
+  {
+    auto expanded_topic = rclcpp::expand_topic_or_service_name(
+      pointCloudTransportTopic(topic, transport), this->get_name(), this->get_namespace());
+    const auto namespace_length = this->get_effective_namespace().length();
+    auto parameter_base_name = expanded_topic.substr(namespace_length);
+    std::replace(parameter_base_name.begin(), parameter_base_name.end(), '/', '.');
+    if (!parameter_base_name.empty() && parameter_base_name.front() == '.') {
+      parameter_base_name = parameter_base_name.substr(1);
+    }
+    return parameter_base_name + "." + parameter;
+  }
+
+  void configurePointCloudTransportPublisher(const rclcpp::QoS & qos)
+  {
+    const auto plugin_name = pointCloudTransportPluginName(compressed_transport_);
+    const auto enable_plugins_parameter = getPointCloudTransportPluginParameterName(output_topic_);
+    const auto zstd_encode_level_parameter =
+      getPointCloudTransportParameterName(output_topic_, compressed_transport_, "encode_level");
+    constexpr int zstd_encode_level = 1;
+
+    if (!this->has_parameter(enable_plugins_parameter)) {
+      this->declare_parameter<std::vector<std::string>>(
+        enable_plugins_parameter, std::vector<std::string>{plugin_name});
+    }
+
+    auto node_ptr = std::shared_ptr<rclcpp::Node>(this, [](rclcpp::Node *) {});
+    try {
+    pub_point_cloud_transport_ = point_cloud_transport::create_publisher(
+      node_ptr, output_topic_, qos.get_rmw_qos_profile());
+
+    if (compressed_transport_ == "zstd" && this->has_parameter(zstd_encode_level_parameter)) {
+      this->set_parameter(rclcpp::Parameter(zstd_encode_level_parameter, zstd_encode_level));
+      RCLCPP_INFO(
+        this->get_logger(),
+        "Configured zstd point cloud encode_level=%d", zstd_encode_level);
+    }
+
+    RCLCPP_INFO(
+      this->get_logger(),
+      "Publishing compressed PointCloud2 on %s/%s using %s",
+        output_topic_.c_str(), compressed_transport_.c_str(), plugin_name.c_str());
+    } catch (const std::exception & e) {
+      use_pointcloud_compressed_ = false;
+      pub_point_cloud_ = this->create_publisher<PointCloud>(output_topic_, qos);
+      RCLCPP_ERROR(
+        this->get_logger(),
+        "Failed to create point_cloud_transport publisher with %s: %s",
+        plugin_name.c_str(), e.what());
+      RCLCPP_WARN(
+        this->get_logger(),
+        "Falling back to raw PointCloud2 on %s. Install the %s package to use compressed point clouds.",
+        output_topic_.c_str(), compressed_transport_.c_str());
+    }
+  }
+
+  uint32_t getPointCloudSubscriptionCount() const
+  {
+    if (use_pointcloud_compressed_) {
+      return pub_point_cloud_transport_.getNumSubscribers();
+    }
+    return pub_point_cloud_ ? pub_point_cloud_->get_subscription_count() : 0;
+  }
+
+  void publishPointCloud(const PointCloud::SharedPtr & cloud_msg) const
+  {
+    if (use_pointcloud_compressed_) {
+      pub_point_cloud_transport_.publish(*cloud_msg);
+      return;
+    }
+    pub_point_cloud_->publish(*cloud_msg);
+  }
+
+  void updateLookupTables(uint32_t width, uint32_t height)
+  {
+    const double fx = model_.fx();
+    const double fy = model_.fy();
+    const double cx = model_.cx();
+    const double cy = model_.cy();
+
+    if (width == lut_width_ && height == lut_height_ &&
+        fx == lut_fx_ && fy == lut_fy_ && cx == lut_cx_ && cy == lut_cy_) {
+      return;
+    }
+
+    x_lut_.resize(width);
+    y_lut_.resize(height);
+
+    for (uint32_t u = 0; u < width; ++u) {
+      x_lut_[u] = (static_cast<float>(u) - static_cast<float>(cx)) / static_cast<float>(fx);
+    }
+    for (uint32_t v = 0; v < height; ++v) {
+      y_lut_[v] = (static_cast<float>(v) - static_cast<float>(cy)) / static_cast<float>(fy);
+    }
+
+    lut_width_ = width;
+    lut_height_ = height;
+    lut_fx_ = fx;
+    lut_fy_ = fy;
+    lut_cx_ = cx;
+    lut_cy_ = cy;
+  }
+
+  static uint32_t fieldOffset(const PointCloud & cloud, const std::string & name)
+  {
+    for (const auto & field : cloud.fields) {
+      if (field.name == name) {
+        return field.offset;
+      }
+    }
+    throw std::runtime_error("PointCloud2 field not found: " + name);
+  }
+
+  static inline void writeFloat(uint8_t * point, uint32_t offset, float value)
+  {
+    std::memcpy(point + offset, &value, sizeof(value));
+  }
+
+  static inline void writeUint32(uint8_t * point, uint32_t offset, uint32_t value)
+  {
+    std::memcpy(point + offset, &value, sizeof(value));
+  }
 
   void imageCb(const sensor_msgs::msg::Image::ConstSharedPtr & depth_msg,
                const sensor_msgs::msg::Image::ConstSharedPtr & rgb_msg)
@@ -173,7 +406,7 @@ private:
       return;
     }
 
-    pub_point_cloud_->publish(*cloud_msg);
+    publishPointCloud(cloud_msg);
   }
 
   void startSubscribing()
@@ -181,9 +414,20 @@ private:
     if (!subscribed_) {
       RCLCPP_INFO(this->get_logger(), "Start subscribing RGB(%s) and Depth(%s)",
                   rgb_transport_.c_str(), depth_transport_.c_str());
-  
-      sub_rgb_.subscribe(this, topic_rgb_, rgb_transport_, rmw_qos_profile_sensor_data);
-      sub_depth_.subscribe(this, topic_depth_, depth_transport_, rmw_qos_profile_sensor_data);
+
+      try {
+        sub_rgb_.subscribe(this, topic_rgb_, rgb_transport_, rmw_qos_profile_sensor_data);
+        sub_depth_.subscribe(this, topic_depth_, depth_transport_, rmw_qos_profile_sensor_data);
+      } catch (const std::exception & e) {
+        sub_rgb_.unsubscribe();
+        sub_depth_.unsubscribe();
+        RCLCPP_ERROR(
+          this->get_logger(),
+          "Failed to subscribe image_transport topics. rgb=%s (%s), depth=%s (%s): %s",
+          topic_rgb_.c_str(), rgb_transport_.c_str(),
+          topic_depth_.c_str(), depth_transport_.c_str(), e.what());
+        return;
+      }
   
       if (exact_sync_) {
         exact_sync_->connectInput(sub_depth_, sub_rgb_);
@@ -209,43 +453,49 @@ private:
                const sensor_msgs::msg::Image::ConstSharedPtr & rgb_msg,
                const PointCloud::SharedPtr & cloud_msg)
   {
-    float center_x = model_.cx();
-    float center_y = model_.cy();
-    double unit_scaling = hma_pcl_reconst2::DepthTraits<T>::toMeters(T(1));
-    float constant_x = unit_scaling / model_.fx();
-    float constant_y = unit_scaling / model_.fy();
-    float bad_point = std::numeric_limits<float>::quiet_NaN();
+    const uint32_t width = cloud_msg->width;
+    const uint32_t height = cloud_msg->height;
+    updateLookupTables(width, height);
 
-    const T * depth_row = reinterpret_cast<const T *>(&depth_msg->data[0]);
-    int row_step = depth_msg->step / sizeof(T);
+    const float bad_point = std::numeric_limits<float>::quiet_NaN();
+    const T * depth_data = reinterpret_cast<const T *>(&depth_msg->data[0]);
+    const int depth_row_step = depth_msg->step / sizeof(T);
     const uint8_t * rgb_data = &rgb_msg->data[0];
-    int rgb_row_step = rgb_msg->step;  // RGB8
+    const int rgb_row_step = rgb_msg->step;
 
-    sensor_msgs::PointCloud2Iterator<float> iter_x(*cloud_msg, "x");
-    sensor_msgs::PointCloud2Iterator<float> iter_y(*cloud_msg, "y");
-    sensor_msgs::PointCloud2Iterator<float> iter_z(*cloud_msg, "z");
-    sensor_msgs::PointCloud2Iterator<float> iter_rgb(*cloud_msg, "rgb");
+    const uint32_t x_offset = fieldOffset(*cloud_msg, "x");
+    const uint32_t y_offset = fieldOffset(*cloud_msg, "y");
+    const uint32_t z_offset = fieldOffset(*cloud_msg, "z");
+    const uint32_t rgb_offset = fieldOffset(*cloud_msg, "rgb");
+    const uint32_t point_step = cloud_msg->point_step;
 
-    // TODO: optimize loop
-    for (int v = 0; v < static_cast<int>(cloud_msg->height); ++v, depth_row += row_step) {
-      const uint8_t * rgb_row = rgb_data + v * rgb_row_step;
-      for (int u = 0; u < static_cast<int>(cloud_msg->width);
-          ++u, ++iter_x, ++iter_y, ++iter_z, ++iter_rgb)
-      {
-        T depth = depth_row[u];
+    for (int v = 0; v < static_cast<int>(height); ++v) {
+      const T * depth_row = depth_data + static_cast<size_t>(v) * depth_row_step;
+      const uint8_t * rgb_row = rgb_data + static_cast<size_t>(v) * rgb_row_step;
+      uint8_t * cloud_row = cloud_msg->data.data() + static_cast<size_t>(v) * cloud_msg->row_step;
+      const float y_scale = y_lut_[v];
+
+      for (uint32_t u = 0; u < width; ++u) {
+        uint8_t * point = cloud_row + static_cast<size_t>(u) * point_step;
+        const T depth = depth_row[u];
+
         if (!hma_pcl_reconst2::DepthTraits<T>::valid(depth)) {
-          *iter_x = *iter_y = *iter_z = bad_point;
+          writeFloat(point, x_offset, bad_point);
+          writeFloat(point, y_offset, bad_point);
+          writeFloat(point, z_offset, bad_point);
         } else {
-          *iter_x = (u - center_x) * depth * constant_x;
-          *iter_y = (v - center_y) * depth * constant_y;
-          *iter_z = hma_pcl_reconst2::DepthTraits<T>::toMeters(depth);
+          const float z = hma_pcl_reconst2::DepthTraits<T>::toMeters(depth);
+          writeFloat(point, x_offset, x_lut_[u] * z);
+          writeFloat(point, y_offset, y_scale * z);
+          writeFloat(point, z_offset, z);
         }
-        const uint8_t * pixel = rgb_row + u * 3;
-        uint8_t r = pixel[0];
-        uint8_t g = pixel[1];
-        uint8_t b = pixel[2];
-        uint32_t rgb = (r << 16) | (g << 8) | b;
-        *iter_rgb = *reinterpret_cast<float *>(&rgb);
+
+        const uint8_t * pixel = rgb_row + static_cast<size_t>(u) * 3;
+        const uint32_t rgb =
+          (static_cast<uint32_t>(pixel[0]) << 16) |
+          (static_cast<uint32_t>(pixel[1]) << 8) |
+          static_cast<uint32_t>(pixel[2]);
+        writeUint32(point, rgb_offset, rgb);
       }
     }
   }
