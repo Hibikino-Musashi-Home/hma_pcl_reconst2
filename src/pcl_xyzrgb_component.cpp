@@ -29,6 +29,7 @@
 #include <cv_bridge/cv_bridge.hpp>
 #include <opencv2/imgproc.hpp>
 
+#include "hma_pcl_reconst2/depth_denoise.hpp"
 #include "hma_pcl_reconst2/depth_traits.hpp"
 
 namespace hma_pcl_reconst2
@@ -110,6 +111,10 @@ public:
     //this->declare_parameter("topic_depth", "/head_rgbd_sensor/depth_registered/image_raw");
     this->declare_parameter("use_compressed", false);
     this->declare_parameter("use_pointcloud_compressed", false);
+    DepthDenoiser::declareParameters(this);
+
+    denoiser_.configure(this);
+    RCLCPP_INFO(this->get_logger(), "Depth denoise: %s", denoiser_.describe().c_str());
 
     use_image_compressed_ = this->get_parameter("use_compressed").as_bool();
     use_pointcloud_compressed_ = this->get_parameter("use_pointcloud_compressed").as_bool();
@@ -200,6 +205,7 @@ private:
   bool subscribed_;
   bool use_image_compressed_;
   bool use_pointcloud_compressed_;
+  DepthDenoiser denoiser_;
 
   using SyncPolicy = message_filters::sync_policies::ApproximateTime<
     sensor_msgs::msg::Image, sensor_msgs::msg::Image>;
@@ -373,13 +379,23 @@ private:
       return;
     }
 
+    // Active-stereo sensors (RealSense, Gemini) need the depth image cleaned up
+    // before it is reprojected; ToF sensors pass straight through.
+    sensor_msgs::msg::Image::ConstSharedPtr depth_in = depth_msg;
+    if (denoiser_.enabled()) {
+      sensor_msgs::msg::Image::SharedPtr denoised;
+      if (denoiser_.apply(depth_msg, denoised)) {
+        depth_in = denoised;
+      }
+    }
+
     PointCloud::SharedPtr cloud_msg(new PointCloud);
-    cloud_msg->header = depth_msg->header;
+    cloud_msg->header = depth_in->header;
     cloud_msg->is_dense = false;
     cloud_msg->is_bigendian = false;
 
-    const uint32_t w = depth_msg->width;
-    const uint32_t h = depth_msg->height;
+    const uint32_t w = depth_in->width;
+    const uint32_t h = depth_in->height;
 
     sensor_msgs::PointCloud2Modifier mod(*cloud_msg);
     mod.setPointCloud2FieldsByString(2, "xyz", "rgb");
@@ -396,13 +412,13 @@ private:
     //   cloud_msg->point_step, cloud_msg->row_step);
 
     // convert depends on depth type
-    if (depth_msg->encoding == enc::TYPE_16UC1) {
-      convert<uint16_t>(depth_msg, rgb_msg, cloud_msg);
-    } else if (depth_msg->encoding == enc::TYPE_32FC1) {
-      convert<float>(depth_msg, rgb_msg, cloud_msg);
+    if (depth_in->encoding == enc::TYPE_16UC1) {
+      convert<uint16_t>(depth_in, rgb_msg, cloud_msg);
+    } else if (depth_in->encoding == enc::TYPE_32FC1) {
+      convert<float>(depth_in, rgb_msg, cloud_msg);
     } else {
       RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-        "Unsupported depth encoding: %s", depth_msg->encoding.c_str());
+        "Unsupported depth encoding: %s", depth_in->encoding.c_str());
       return;
     }
 
@@ -445,6 +461,7 @@ private:
       sub_rgb_.unsubscribe();
       sub_depth_.unsubscribe();
       subscribed_ = false;
+      denoiser_.reset();
     }
   }
 

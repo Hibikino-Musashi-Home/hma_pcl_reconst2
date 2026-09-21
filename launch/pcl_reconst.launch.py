@@ -36,6 +36,27 @@ def launch_setup(context):
     use_pointcloud_compressed = LaunchConfiguration(
         'use_pointcloud_compressed')
 
+    # Tuning arguments default to '' and are simply left out when unset, so the
+    # node's own defaults stay the single source of truth for them.
+    denoise_params = {
+        'denoise.enable': ParameterValue(
+            LaunchConfiguration('denoise'), value_type=bool),
+    }
+    tuning = {
+        'denoise.clip.min_depth': float,
+        'denoise.clip.max_depth': float,
+        'denoise.speckle.max_size': int,
+        'denoise.speckle.diff_quad': float,
+        'denoise.bilateral.radius': int,
+        'denoise.bilateral.sigma_quad': float,
+        'denoise.temporal.alpha': float,
+    }
+    for name, value_type in tuning.items():
+        arg = name.replace('.', '_')
+        raw = LaunchConfiguration(arg).perform(context)
+        if raw != '':
+            denoise_params[name] = value_type(raw)
+
     container = ComposableNodeContainer(
         name='cloud_reconst_container',
         namespace='',
@@ -60,6 +81,7 @@ def launch_setup(context):
                         'use_pointcloud_compressed': ParameterValue(
                             use_pointcloud_compressed, value_type=bool
                         ),
+                        **denoise_params,
                     }
                 ],
             )
@@ -106,5 +128,44 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument('use_pointcloud_compressed',
                               default_value='false'),
+        DeclareLaunchArgument(
+            'denoise',
+            default_value='false',
+            description='Denoise the depth image before reprojecting it. Needed for '
+                        'active-stereo sensors (RealSense, Orbbec Gemini) whose planes '
+                        'are noisy; leave off for ToF sensors such as the Xtion.',
+        ),
+        DeclareLaunchArgument(
+            'denoise_clip_min_depth', default_value='',
+            description='[m] Depth below this is discarded. Empty keeps the node default.',
+        ),
+        DeclareLaunchArgument(
+            'denoise_clip_max_depth', default_value='',
+            description='[m] Depth above this is discarded. Set it comfortably beyond the '
+                        'furthest surface you care about: a surface sitting on the limit '
+                        'loses half its pixels to the clip.',
+        ),
+        DeclareLaunchArgument(
+            'denoise_speckle_max_size', default_value='',
+            description='[px] Connected components smaller than this are dropped.',
+        ),
+        DeclareLaunchArgument(
+            'denoise_speckle_diff_quad', default_value='',
+            description='[1/m] z^2 term of the speckle connectivity tolerance. Raise it if '
+                        'distant surfaces are being deleted.',
+        ),
+        DeclareLaunchArgument(
+            'denoise_bilateral_radius', default_value='',
+            description='Bilateral window radius (2 => 5x5). 0 disables the stage.',
+        ),
+        DeclareLaunchArgument(
+            'denoise_bilateral_sigma_quad', default_value='',
+            description='[1/m] z^2 term of the bilateral range sigma, i.e. the sigma in '
+                        'inverse-depth space. The main knob for flattening planes.',
+        ),
+        DeclareLaunchArgument(
+            'denoise_temporal_alpha', default_value='',
+            description='Weight of the new frame in the temporal EMA. 0 disables it.',
+        ),
         OpaqueFunction(function=launch_setup),
     ])

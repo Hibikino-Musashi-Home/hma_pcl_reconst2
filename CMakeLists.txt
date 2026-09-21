@@ -21,6 +21,7 @@ include_directories(include)
 # for compopnent
 add_library(${PROJECT_NAME} SHARED
   src/pcl_xyzrgb_component.cpp
+  src/depth_denoise.cpp
 )
 
 add_executable(pcl_transport_viewer
