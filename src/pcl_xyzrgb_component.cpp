@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <limits>
 #include <cstring>
@@ -27,6 +28,7 @@
 
 #include <image_geometry/pinhole_camera_model.hpp>
 #include <cv_bridge/cv_bridge.hpp>
+#include <opencv2/core/utility.hpp>
 #include <opencv2/imgproc.hpp>
 
 #include "hma_pcl_reconst2/depth_denoise.hpp"
@@ -111,10 +113,31 @@ public:
     //this->declare_parameter("topic_depth", "/head_rgbd_sensor/depth_registered/image_raw");
     this->declare_parameter("use_compressed", false);
     this->declare_parameter("use_pointcloud_compressed", false);
+    // History depth of the image subscriptions. 1 always processes the newest frame:
+    // a deeper queue only adds latency (a full queue of stale frames) whenever
+    // processing takes about as long as the frame period.
+    this->declare_parameter("input_queue_depth", 1);
     DepthDenoiser::declareParameters(this);
 
     denoiser_.configure(this);
     RCLCPP_INFO(this->get_logger(), "Depth denoise: %s", denoiser_.describe().c_str());
+
+    // Re-configure the denoiser whenever a denoise.* parameter is changed at runtime
+    // (ros2 param set / rqt_reconfigure), so it can be tuned against a live camera.
+    param_cb_ = this->add_post_set_parameters_callback(
+      [this](const std::vector<rclcpp::Parameter> & params) {
+        const bool touched = std::any_of(
+          params.begin(), params.end(), [](const rclcpp::Parameter & p) {
+            return p.get_name().rfind("denoise.", 0) == 0;
+          });
+        if (!touched) {
+          return;
+        }
+        std::lock_guard<std::mutex> lock(denoise_mutex_);
+        denoiser_.configure(this);
+        RCLCPP_INFO(
+          this->get_logger(), "Depth denoise reconfigured: %s", denoiser_.describe().c_str());
+      });
 
     use_image_compressed_ = this->get_parameter("use_compressed").as_bool();
     use_pointcloud_compressed_ = this->get_parameter("use_pointcloud_compressed").as_bool();
@@ -170,12 +193,22 @@ public:
         std::bind(&PointCloudXyzrgb::imageCb, this, std::placeholders::_1, std::placeholders::_2));
     }
 
+    // Image processing runs in its own callback group so that the parameter services,
+    // which stay in the default group, keep answering while imageCb is busy (under
+    // component_container_mt). Otherwise a 30 Hz 1280x720 stream starves them and
+    // rqt_reconfigure times out.
+    image_cb_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    image_sub_options_.callback_group = image_cb_group_;
+    image_qos_ = rmw_qos_profile_sensor_data;
+    image_qos_.depth = static_cast<size_t>(
+      std::max<int64_t>(1, this->get_parameter("input_queue_depth").as_int()));
+
     //camera info
     sub_info_ = this->create_subscription<sensor_msgs::msg::CameraInfo>(
       topic_camera_info_, 1,
       [this](sensor_msgs::msg::CameraInfo::ConstSharedPtr msg) {
         model_.fromCameraInfo(msg);
-      });
+      }, image_sub_options_);
 
     timer_ = this->create_wall_timer(1000ms, [this]() {
     auto subs = this->getPointCloudSubscriptionCount();
@@ -191,7 +224,7 @@ public:
         RCLCPP_INFO(this->get_logger(), "hma_pcl_reconst2.-> No subscribers, unsubscribing from topics.");
         }
       }
-    });
+    }, image_cb_group_);
 
     RCLCPP_INFO(this->get_logger(), "hma_pcl_reconst2.-> component initialized");
   }
@@ -202,10 +235,15 @@ private:
   std::string rgb_transport_, depth_transport_;
   std::string output_topic_, compressed_transport_;
   rclcpp::TimerBase::SharedPtr timer_;
+  rclcpp::CallbackGroup::SharedPtr image_cb_group_;
+  rclcpp::SubscriptionOptions image_sub_options_;
+  rmw_qos_profile_t image_qos_;
   bool subscribed_;
   bool use_image_compressed_;
   bool use_pointcloud_compressed_;
   DepthDenoiser denoiser_;
+  std::mutex denoise_mutex_;
+  rclcpp::node_interfaces::PostSetParametersCallbackHandle::SharedPtr param_cb_;
 
   using SyncPolicy = message_filters::sync_policies::ApproximateTime<
     sensor_msgs::msg::Image, sensor_msgs::msg::Image>;
@@ -379,50 +417,82 @@ private:
       return;
     }
 
+    std::lock_guard<std::mutex> lock(denoise_mutex_);
+
     // Active-stereo sensors (RealSense, Gemini) need the depth image cleaned up
     // before it is reprojected; ToF sensors pass straight through.
-    sensor_msgs::msg::Image::ConstSharedPtr depth_in = depth_msg;
+    // The denoised depth is consumed straight from the filter in metres: no 16UC1
+    // re-encode, and no 1 mm quantization of the result.
+    bool denoised_ok = false;
     if (denoiser_.enabled()) {
-      sensor_msgs::msg::Image::SharedPtr denoised;
-      if (denoiser_.apply(depth_msg, denoised)) {
-        depth_in = denoised;
-      }
+      denoiser_.setIntrinsics(model_.fx(), model_.fy(), model_.cx(), model_.cy());
+      denoised_ok = denoiser_.process(depth_msg);
     }
 
-    PointCloud::SharedPtr cloud_msg(new PointCloud);
-    cloud_msg->header = depth_in->header;
-    cloud_msg->is_dense = false;
-    cloud_msg->is_bigendian = false;
-
-    const uint32_t w = depth_in->width;
-    const uint32_t h = depth_in->height;
-
-    sensor_msgs::PointCloud2Modifier mod(*cloud_msg);
-    mod.setPointCloud2FieldsByString(2, "xyz", "rgb");
-    mod.resize(w * h);
-
-    cloud_msg->width = w;
-    cloud_msg->height = h;
-
-    cloud_msg->row_step = cloud_msg->point_step * cloud_msg->width;
-
-    // RCLCPP_INFO(this->get_logger(),
-    //   "Cloud initialized: %dx%d point_step=%d row_step=%d",
-    //   cloud_msg->width, cloud_msg->height,
-    //   cloud_msg->point_step, cloud_msg->row_step);
-
-    // convert depends on depth type
-    if (depth_in->encoding == enc::TYPE_16UC1) {
-      convert<uint16_t>(depth_in, rgb_msg, cloud_msg);
-    } else if (depth_in->encoding == enc::TYPE_32FC1) {
-      convert<float>(depth_in, rgb_msg, cloud_msg);
+    PointCloud::SharedPtr cloud_msg;
+    if (denoised_ok) {
+      const cv::Mat & depth = denoiser_.depthMeters();
+      cloud_msg = makeCloud(depth_msg->header, depth.cols, depth.rows);
+      convert<float>(depth.ptr<float>(0), depth.step1(), rgb_msg, cloud_msg);
     } else {
-      RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-        "Unsupported depth encoding: %s", depth_in->encoding.c_str());
+      cloud_msg = buildCloud(depth_msg, rgb_msg);
+    }
+    if (!cloud_msg) {
       return;
     }
 
     publishPointCloud(cloud_msg);
+  }
+
+  // Organized, unfilled XYZRGB cloud: 16 bytes per point (x, y, z, rgb as FLOAT32, no
+  // padding), half the size of the padded 32-byte layout, which matters most when the
+  // cloud is sent to another process.
+  static PointCloud::SharedPtr makeCloud(
+    const std_msgs::msg::Header & header, uint32_t w, uint32_t h)
+  {
+    PointCloud::SharedPtr cloud_msg(new PointCloud);
+    cloud_msg->header = header;
+    cloud_msg->is_dense = false;
+    cloud_msg->is_bigendian = false;
+
+    sensor_msgs::PointCloud2Modifier mod(*cloud_msg);
+    mod.setPointCloud2Fields(
+      4,
+      "x", 1, sensor_msgs::msg::PointField::FLOAT32,
+      "y", 1, sensor_msgs::msg::PointField::FLOAT32,
+      "z", 1, sensor_msgs::msg::PointField::FLOAT32,
+      "rgb", 1, sensor_msgs::msg::PointField::FLOAT32);
+    mod.resize(w * h);
+
+    cloud_msg->width = w;
+    cloud_msg->height = h;
+    cloud_msg->row_step = cloud_msg->point_step * cloud_msg->width;
+    return cloud_msg;
+  }
+
+  // Reprojects `depth_msg` into an organized XYZRGB cloud. Returns nullptr for an
+  // unsupported depth encoding.
+  PointCloud::SharedPtr buildCloud(
+    const sensor_msgs::msg::Image::ConstSharedPtr & depth_msg,
+    const sensor_msgs::msg::Image::ConstSharedPtr & rgb_msg)
+  {
+    auto cloud_msg = makeCloud(depth_msg->header, depth_msg->width, depth_msg->height);
+
+    // convert depends on depth type
+    if (depth_msg->encoding == enc::TYPE_16UC1) {
+      convert<uint16_t>(
+        reinterpret_cast<const uint16_t *>(depth_msg->data.data()),
+        depth_msg->step / sizeof(uint16_t), rgb_msg, cloud_msg);
+    } else if (depth_msg->encoding == enc::TYPE_32FC1) {
+      convert<float>(
+        reinterpret_cast<const float *>(depth_msg->data.data()),
+        depth_msg->step / sizeof(float), rgb_msg, cloud_msg);
+    } else {
+      RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+        "Unsupported depth encoding: %s", depth_msg->encoding.c_str());
+      return nullptr;
+    }
+    return cloud_msg;
   }
 
   void startSubscribing()
@@ -432,8 +502,10 @@ private:
                   rgb_transport_.c_str(), depth_transport_.c_str());
 
       try {
-        sub_rgb_.subscribe(this, topic_rgb_, rgb_transport_, rmw_qos_profile_sensor_data);
-        sub_depth_.subscribe(this, topic_depth_, depth_transport_, rmw_qos_profile_sensor_data);
+        sub_rgb_.subscribe(
+          this, topic_rgb_, rgb_transport_, image_qos_, image_sub_options_);
+        sub_depth_.subscribe(
+          this, topic_depth_, depth_transport_, image_qos_, image_sub_options_);
       } catch (const std::exception & e) {
         sub_rgb_.unsubscribe();
         sub_depth_.unsubscribe();
@@ -461,12 +533,14 @@ private:
       sub_rgb_.unsubscribe();
       sub_depth_.unsubscribe();
       subscribed_ = false;
+      std::lock_guard<std::mutex> lock(denoise_mutex_);
       denoiser_.reset();
     }
   }
 
+  // Rows are independent, so they are split across OpenCV's thread pool.
   template<typename T>
-  void convert(const sensor_msgs::msg::Image::ConstSharedPtr & depth_msg,
+  void convert(const T * depth_data, size_t depth_row_step,
                const sensor_msgs::msg::Image::ConstSharedPtr & rgb_msg,
                const PointCloud::SharedPtr & cloud_msg)
   {
@@ -475,46 +549,49 @@ private:
     updateLookupTables(width, height);
 
     const float bad_point = std::numeric_limits<float>::quiet_NaN();
-    const T * depth_data = reinterpret_cast<const T *>(&depth_msg->data[0]);
-    const int depth_row_step = depth_msg->step / sizeof(T);
     const uint8_t * rgb_data = &rgb_msg->data[0];
-    const int rgb_row_step = rgb_msg->step;
+    const size_t rgb_row_step = rgb_msg->step;
 
     const uint32_t x_offset = fieldOffset(*cloud_msg, "x");
     const uint32_t y_offset = fieldOffset(*cloud_msg, "y");
     const uint32_t z_offset = fieldOffset(*cloud_msg, "z");
     const uint32_t rgb_offset = fieldOffset(*cloud_msg, "rgb");
     const uint32_t point_step = cloud_msg->point_step;
+    uint8_t * cloud_data = cloud_msg->data.data();
+    const size_t cloud_row_step = cloud_msg->row_step;
 
-    for (int v = 0; v < static_cast<int>(height); ++v) {
-      const T * depth_row = depth_data + static_cast<size_t>(v) * depth_row_step;
-      const uint8_t * rgb_row = rgb_data + static_cast<size_t>(v) * rgb_row_step;
-      uint8_t * cloud_row = cloud_msg->data.data() + static_cast<size_t>(v) * cloud_msg->row_step;
-      const float y_scale = y_lut_[v];
+    cv::parallel_for_(
+      cv::Range(0, static_cast<int>(height)), [&](const cv::Range & range) {
+        for (int v = range.start; v < range.end; ++v) {
+          const T * depth_row = depth_data + static_cast<size_t>(v) * depth_row_step;
+          const uint8_t * rgb_row = rgb_data + static_cast<size_t>(v) * rgb_row_step;
+          uint8_t * cloud_row = cloud_data + static_cast<size_t>(v) * cloud_row_step;
+          const float y_scale = y_lut_[v];
 
-      for (uint32_t u = 0; u < width; ++u) {
-        uint8_t * point = cloud_row + static_cast<size_t>(u) * point_step;
-        const T depth = depth_row[u];
+          for (uint32_t u = 0; u < width; ++u) {
+            uint8_t * point = cloud_row + static_cast<size_t>(u) * point_step;
+            const T depth = depth_row[u];
 
-        if (!hma_pcl_reconst2::DepthTraits<T>::valid(depth)) {
-          writeFloat(point, x_offset, bad_point);
-          writeFloat(point, y_offset, bad_point);
-          writeFloat(point, z_offset, bad_point);
-        } else {
-          const float z = hma_pcl_reconst2::DepthTraits<T>::toMeters(depth);
-          writeFloat(point, x_offset, x_lut_[u] * z);
-          writeFloat(point, y_offset, y_scale * z);
-          writeFloat(point, z_offset, z);
+            if (!hma_pcl_reconst2::DepthTraits<T>::valid(depth)) {
+              writeFloat(point, x_offset, bad_point);
+              writeFloat(point, y_offset, bad_point);
+              writeFloat(point, z_offset, bad_point);
+            } else {
+              const float z = hma_pcl_reconst2::DepthTraits<T>::toMeters(depth);
+              writeFloat(point, x_offset, x_lut_[u] * z);
+              writeFloat(point, y_offset, y_scale * z);
+              writeFloat(point, z_offset, z);
+            }
+
+            const uint8_t * pixel = rgb_row + static_cast<size_t>(u) * 3;
+            const uint32_t rgb =
+              (static_cast<uint32_t>(pixel[0]) << 16) |
+              (static_cast<uint32_t>(pixel[1]) << 8) |
+              static_cast<uint32_t>(pixel[2]);
+            writeUint32(point, rgb_offset, rgb);
+          }
         }
-
-        const uint8_t * pixel = rgb_row + static_cast<size_t>(u) * 3;
-        const uint32_t rgb =
-          (static_cast<uint32_t>(pixel[0]) << 16) |
-          (static_cast<uint32_t>(pixel[1]) << 8) |
-          static_cast<uint32_t>(pixel[2]);
-        writeUint32(point, rgb_offset, rgb);
-      }
-    }
+      });
   }
 };
 

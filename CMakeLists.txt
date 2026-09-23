@@ -61,7 +61,7 @@ install(TARGETS ${PROJECT_NAME} pcl_transport_viewer
 install(DIRECTORY include/
   DESTINATION include)
 
-install(DIRECTORY launch
+install(DIRECTORY launch rviz
   DESTINATION share/${PROJECT_NAME})
 
 install(FILES README.md

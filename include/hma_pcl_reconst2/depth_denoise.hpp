@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -8,6 +9,7 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
+
 
 namespace hma_pcl_reconst2
 {
@@ -73,6 +75,18 @@ public:
     float temporal_diff_base = 0.02f;  // [m]
     float temporal_diff_quad = 0.008f; // [1/m]
     double temporal_max_gap_sec = 0.5; // reset the EMA after a gap this long
+
+    // 5. plane snap: detect the dominant planes (multi-plane RANSAC on a sparse grid)
+    // and move every pixel within tol(z) of a plane onto it, along its viewing ray.
+    // Removes the low-frequency waviness of stereo depth that local filters cannot,
+    // at the price of flattening anything thinner than tol(z) lying on a plane.
+    bool snap_enable = false;
+    int snap_max_planes = 4;
+    float snap_min_fraction = 0.05f;   // plane must cover this share of the valid samples
+    float snap_diff_base = 0.004f;     // [m]
+    float snap_diff_quad = 0.004f;     // [1/m]  tol(2 m) = 2 cm
+    int snap_stride = 8;               // [px] sample grid spacing for plane detection
+    int snap_iterations = 200;         // RANSAC hypotheses per plane
   };
 
   DepthDenoiser();
@@ -87,6 +101,9 @@ public:
   void configure(const Params & params);
 
   bool enabled() const {return params_.enable;}
+
+  // Pinhole intrinsics of the depth image; required by the plane snap stage.
+  void setIntrinsics(double fx, double fy, double cx, double cy);
   const Params & params() const {return params_;}
 
   // One-line summary of the active configuration, for logging.
@@ -103,7 +120,16 @@ public:
     const sensor_msgs::msg::Image::ConstSharedPtr & in,
     sensor_msgs::msg::Image::SharedPtr & out);
 
+  // Same filtering as apply(), but without re-encoding: the result stays available
+  // through depthMeters() until the next call. Saves the encode/decode round trip and
+  // the 1 mm quantization of 16UC1 when the caller can consume metres directly.
+  bool process(const sensor_msgs::msg::Image::ConstSharedPtr & in);
+
+  // CV_32FC1 depth in metres (NaN = invalid) from the last successful process()/apply().
+  const cv::Mat & depthMeters() const {return work_;}
+
 private:
+  bool run(const sensor_msgs::msg::Image::ConstSharedPtr & in, bool & is_16u);
   void buildTables();
 
   void decode(const sensor_msgs::msg::Image & in, bool is_16u);
@@ -113,6 +139,7 @@ private:
   void applySpeckle();
   void applyBilateral();
   void applyTemporal(int64_t stamp_ns, const std::string & frame_id);
+  void applySnap();
 
   Params params_;
   bool configured_ = false;
@@ -143,6 +170,17 @@ private:
   int64_t prev_stamp_ns_ = 0;
   std::string prev_frame_id_;
   bool has_prev_ = false;
+
+  // plane snap state
+  float fx_ = 0.0f, fy_ = 0.0f, cx_ = 0.0f, cy_ = 0.0f;
+  std::vector<cv::Vec4f> planes_;     // last frame's planes, re-tried first for stability
+  std::vector<cv::Vec3f> samples_;
+  std::vector<int32_t> sample_grid_;  // grid cell -> sample index, -1 if invalid
+  std::vector<int32_t> sample_cell_;  // sample index -> grid cell
+  std::vector<uint8_t> sample_used_;
+  std::vector<float> ray_x_, ray_y_;
+  std::mt19937 rng_{12345};
+
 };
 
 }  // namespace hma_pcl_reconst2

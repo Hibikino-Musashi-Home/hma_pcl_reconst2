@@ -142,6 +142,15 @@ void DepthDenoiser::declareParameters(rclcpp::Node * node)
   declare_double("denoise.temporal.diff_base", d.temporal_diff_base);
   declare_double("denoise.temporal.diff_quad", d.temporal_diff_quad);
   declare_double("denoise.temporal.max_gap_sec", d.temporal_max_gap_sec);
+
+  declare_bool("denoise.snap.enable", d.snap_enable);
+  declare_int("denoise.snap.max_planes", d.snap_max_planes);
+  declare_double("denoise.snap.min_fraction", d.snap_min_fraction);
+  declare_double("denoise.snap.diff_base", d.snap_diff_base);
+  declare_double("denoise.snap.diff_quad", d.snap_diff_quad);
+  declare_int("denoise.snap.stride", d.snap_stride);
+  declare_int("denoise.snap.iterations", d.snap_iterations);
+
 }
 
 void DepthDenoiser::configure(rclcpp::Node * node)
@@ -188,6 +197,16 @@ void DepthDenoiser::configure(rclcpp::Node * node)
     static_cast<float>(node->get_parameter("denoise.temporal.diff_quad").as_double());
   p.temporal_max_gap_sec = node->get_parameter("denoise.temporal.max_gap_sec").as_double();
 
+  p.snap_enable = node->get_parameter("denoise.snap.enable").as_bool();
+  p.snap_max_planes = static_cast<int>(node->get_parameter("denoise.snap.max_planes").as_int());
+  p.snap_min_fraction =
+    static_cast<float>(node->get_parameter("denoise.snap.min_fraction").as_double());
+  p.snap_diff_base = static_cast<float>(node->get_parameter("denoise.snap.diff_base").as_double());
+  p.snap_diff_quad = static_cast<float>(node->get_parameter("denoise.snap.diff_quad").as_double());
+  p.snap_stride = static_cast<int>(node->get_parameter("denoise.snap.stride").as_int());
+  p.snap_iterations = static_cast<int>(node->get_parameter("denoise.snap.iterations").as_int());
+
+
   if (p.min_depth >= p.max_depth) {
     RCLCPP_WARN(
       logger_, "min_depth (%.3f) >= max_depth (%.3f); disabling the range clip.",
@@ -217,6 +236,11 @@ void DepthDenoiser::configure(const Params & params)
   params_.bilateral_radius = std::clamp(params_.bilateral_radius, 0, 8);
   params_.temporal_alpha = std::clamp(params_.temporal_alpha, 0.0f, 1.0f);
   params_.speckle_max_size = std::max(params_.speckle_max_size, 0);
+  params_.snap_max_planes = std::clamp(params_.snap_max_planes, 0, 16);
+  params_.snap_stride = std::clamp(params_.snap_stride, 1, 64);
+  params_.snap_iterations = std::clamp(params_.snap_iterations, 1, 5000);
+  params_.snap_min_fraction = std::clamp(params_.snap_min_fraction, 0.0f, 1.0f);
+  planes_.clear();
   buildTables();
   reset();
   configured_ = true;
@@ -281,7 +305,22 @@ std::string DepthDenoiser::describe() const
   } else {
     os << "off";
   }
+  os << ", snap=";
+  if (params_.snap_enable && params_.snap_max_planes > 0) {
+    os << "<=" << params_.snap_max_planes << " planes tol(z)=" << params_.snap_diff_base << "+"
+       << params_.snap_diff_quad << "*z^2";
+  } else {
+    os << "off";
+  }
   return os.str();
+}
+
+void DepthDenoiser::setIntrinsics(double fx, double fy, double cx, double cy)
+{
+  fx_ = static_cast<float>(fx);
+  fy_ = static_cast<float>(fy);
+  cx_ = static_cast<float>(cx);
+  cy_ = static_cast<float>(cy);
 }
 
 void DepthDenoiser::reset()
@@ -292,15 +331,12 @@ void DepthDenoiser::reset()
   has_prev_ = false;
 }
 
-bool DepthDenoiser::apply(
-  const sensor_msgs::msg::Image::ConstSharedPtr & in,
-  sensor_msgs::msg::Image::SharedPtr & out)
+bool DepthDenoiser::run(const sensor_msgs::msg::Image::ConstSharedPtr & in, bool & is_16u)
 {
   if (!configured_ || !params_.enable || !in) {
     return false;
   }
 
-  bool is_16u = false;
   size_t pixel_bytes = 0;
   if (in->encoding == enc::TYPE_16UC1) {
     is_16u = true;
@@ -350,6 +386,27 @@ bool DepthDenoiser::apply(
   if (params_.temporal_enable && params_.temporal_alpha > 0.0f) {
     applyTemporal(stampToNanoseconds(in->header.stamp), in->header.frame_id);
   }
+  // After temporal, so the EMA state (prev_) keeps the unsnapped depth.
+  if (params_.snap_enable && params_.snap_max_planes > 0) {
+    applySnap();
+  }
+  return true;
+}
+
+bool DepthDenoiser::process(const sensor_msgs::msg::Image::ConstSharedPtr & in)
+{
+  bool is_16u = false;
+  return run(in, is_16u);
+}
+
+bool DepthDenoiser::apply(
+  const sensor_msgs::msg::Image::ConstSharedPtr & in,
+  sensor_msgs::msg::Image::SharedPtr & out)
+{
+  bool is_16u = false;
+  if (!run(in, is_16u)) {
+    return false;
+  }
 
   out = std::make_shared<sensor_msgs::msg::Image>();
   out->header = in->header;
@@ -357,10 +414,9 @@ bool DepthDenoiser::apply(
   out->width = in->width;
   out->encoding = in->encoding;
   out->is_bigendian = 0;
-  out->step = static_cast<uint32_t>(min_step);
+  out->step = in->width * static_cast<uint32_t>(is_16u ? sizeof(uint16_t) : sizeof(float));
   out->data.resize(static_cast<size_t>(out->step) * static_cast<size_t>(out->height));
   encode(*out, is_16u);
-
   return true;
 }
 
@@ -415,15 +471,18 @@ void DepthDenoiser::applyClip()
   const float lo = params_.min_depth;
   const float hi = params_.max_depth;
 
-  for (int y = 0; y < rows; ++y) {
-    float * row = work_.ptr<float>(y);
-    for (int x = 0; x < cols; ++x) {
-      const float z = row[x];
-      if (!std::isfinite(z) || z < lo || z > hi) {
-        row[x] = kNaN;
+  cv::parallel_for_(
+    cv::Range(0, rows), [&](const cv::Range & range) {
+      for (int y = range.start; y < range.end; ++y) {
+        float * row = work_.ptr<float>(y);
+        for (int x = 0; x < cols; ++x) {
+          const float z = row[x];
+          if (!std::isfinite(z) || z < lo || z > hi) {
+            row[x] = kNaN;
+          }
+        }
       }
-    }
-  }
+    });
 }
 
 void DepthDenoiser::applySpeckle()
@@ -639,31 +698,305 @@ void DepthDenoiser::applyTemporal(int64_t stamp_ns, const std::string & frame_id
   const float base = params_.temporal_diff_base;
   const float quad = params_.temporal_diff_quad;
 
-  for (int y = 0; y < rows; ++y) {
-    float * cur = work_.ptr<float>(y);
-    float * prev = prev_.ptr<float>(y);
-    for (int x = 0; x < cols; ++x) {
-      const float c = cur[x];
-      const float p = prev[x];
-      float value;
-      if (!std::isfinite(c)) {
-        // Never hole-fill from the previous frame: that is how ghosts appear.
-        value = kNaN;
-      } else if (!std::isfinite(p)) {
-        value = c;
-      } else if (std::fabs(c - p) > toleranceAt(c, base, quad)) {
-        // Real motion, not noise. Restart the average from the current sample.
-        value = c;
-      } else {
-        value = alpha * c + one_minus * p;
+  cv::parallel_for_(
+    cv::Range(0, rows), [&](const cv::Range & range) {
+      for (int y = range.start; y < range.end; ++y) {
+        float * cur = work_.ptr<float>(y);
+        float * prev = prev_.ptr<float>(y);
+        for (int x = 0; x < cols; ++x) {
+          const float c = cur[x];
+          const float p = prev[x];
+          float value;
+          if (!std::isfinite(c)) {
+            // Never hole-fill from the previous frame: that is how ghosts appear.
+            value = kNaN;
+          } else if (!std::isfinite(p)) {
+            value = c;
+          } else if (std::fabs(c - p) > toleranceAt(c, base, quad)) {
+            // Real motion, not noise. Restart the average from the current sample.
+            value = c;
+          } else {
+            value = alpha * c + one_minus * p;
+          }
+          cur[x] = value;
+          prev[x] = value;
+        }
       }
-      cur[x] = value;
-      prev[x] = value;
-    }
-  }
+    });
 
   prev_stamp_ns_ = stamp_ns;
   prev_frame_id_ = frame_id;
+}
+
+namespace
+{
+
+// Plane n.p + d = 0 through three points; false when they are (nearly) collinear.
+inline bool planeFrom3(
+  const cv::Vec3f & a, const cv::Vec3f & b, const cv::Vec3f & c, cv::Vec4f & plane)
+{
+  cv::Vec3f n = (b - a).cross(c - a);
+  const float len = static_cast<float>(cv::norm(n));
+  if (len < 1e-6f) {
+    return false;
+  }
+  n /= len;
+  plane = cv::Vec4f(n[0], n[1], n[2], -n.dot(a));
+  return true;
+}
+
+inline float planeDistance(const cv::Vec4f & pl, const cv::Vec3f & p)
+{
+  return std::fabs(pl[0] * p[0] + pl[1] * p[1] + pl[2] * p[2] + pl[3]);
+}
+
+// Least-squares plane through `pts` (smallest-eigenvalue direction of the covariance).
+bool fitPlane(const std::vector<cv::Vec3f> & pts, cv::Vec4f & plane)
+{
+  if (pts.size() < 3) {
+    return false;
+  }
+  cv::Vec3d mean(0, 0, 0);
+  for (const auto & p : pts) {
+    mean += cv::Vec3d(p[0], p[1], p[2]);
+  }
+  mean /= static_cast<double>(pts.size());
+  cv::Matx33d cov = cv::Matx33d::zeros();
+  for (const auto & p : pts) {
+    const cv::Vec3d q = cv::Vec3d(p[0], p[1], p[2]) - mean;
+    cov += q * q.t();
+  }
+  cv::Mat evals, evecs;
+  if (!cv::eigen(cv::Mat(cov), evals, evecs)) {
+    return false;
+  }
+  // eigenvalues are sorted in descending order: the last row is the normal
+  const cv::Vec3d n(evecs.at<double>(2, 0), evecs.at<double>(2, 1), evecs.at<double>(2, 2));
+  plane = cv::Vec4f(
+    static_cast<float>(n[0]), static_cast<float>(n[1]), static_cast<float>(n[2]),
+    static_cast<float>(-n.dot(mean)));
+  return true;
+}
+
+}  // namespace
+
+constexpr float kSnapParallelCos = 0.985f;     // ~10 deg
+constexpr float kSnapDuplicateOffset = 0.10f;  // [m]
+
+void DepthDenoiser::applySnap()
+{
+  if (fx_ <= 0.0f || fy_ <= 0.0f) {
+    if (clock_) {
+      RCLCPP_WARN_THROTTLE(logger_, *clock_, 5000, "No camera intrinsics yet; skipping plane snap.");
+    }
+    return;
+  }
+
+  const int rows = work_.rows;
+  const int cols = work_.cols;
+  const int stride = params_.snap_stride;
+  const float base = params_.snap_diff_base;
+  const float quad = params_.snap_diff_quad;
+
+  ray_x_.resize(static_cast<size_t>(cols));
+  ray_y_.resize(static_cast<size_t>(rows));
+  for (int x = 0; x < cols; ++x) {
+    ray_x_[static_cast<size_t>(x)] = (static_cast<float>(x) - cx_) / fx_;
+  }
+  for (int y = 0; y < rows; ++y) {
+    ray_y_[static_cast<size_t>(y)] = (static_cast<float>(y) - cy_) / fy_;
+  }
+
+  // 1. sparse sample grid
+  const int gw = (cols + stride - 1) / stride;
+  const int gh = (rows + stride - 1) / stride;
+  samples_.clear();
+  sample_cell_.clear();
+  sample_grid_.assign(static_cast<size_t>(gw) * static_cast<size_t>(gh), -1);
+  for (int gy = 0; gy < gh; ++gy) {
+    const int y = std::min(gy * stride + stride / 2, rows - 1);
+    const float * row = work_.ptr<float>(y);
+    for (int gx = 0; gx < gw; ++gx) {
+      const int x = std::min(gx * stride + stride / 2, cols - 1);
+      const float z = row[x];
+      if (std::isfinite(z)) {
+        sample_grid_[static_cast<size_t>(gy * gw + gx)] = static_cast<int32_t>(samples_.size());
+        sample_cell_.push_back(gy * gw + gx);
+        samples_.emplace_back(ray_x_[static_cast<size_t>(x)] * z, ray_y_[static_cast<size_t>(y)] * z, z);
+      }
+    }
+  }
+  const int n = static_cast<int>(samples_.size());
+  if (n < 100) {
+    planes_.clear();
+    return;
+  }
+  sample_used_.assign(static_cast<size_t>(n), 0);
+  const int min_inliers = std::max(50, static_cast<int>(params_.snap_min_fraction * n));
+
+  auto isInlier = [base, quad](const cv::Vec4f & pl, const cv::Vec3f & p) {
+      return planeDistance(pl, p) < toleranceAt(p[2], base, quad);
+    };
+
+  // Hypotheses are scored on a fixed random subset to keep RANSAC cheap.
+  std::vector<int32_t> subset;
+  std::vector<cv::Vec3f> inliers;
+  std::vector<cv::Vec4f> found;
+  constexpr int kScoreSamples = 2000;
+  constexpr int kLocalWindow = 12;  // [grid cells] triplets are drawn locally
+  std::uniform_int_distribution<int> pick_sample(0, n - 1);
+  std::uniform_int_distribution<int> pick_offset(-kLocalWindow, kLocalWindow);
+
+  for (int k = 0; k < params_.snap_max_planes; ++k) {
+    subset.clear();
+    for (int i = 0; i < n; ++i) {
+      if (!sample_used_[static_cast<size_t>(i)]) {
+        subset.push_back(i);
+      }
+    }
+    const int remaining = static_cast<int>(subset.size());
+    if (remaining < min_inliers) {
+      break;
+    }
+    if (remaining > kScoreSamples) {
+      std::shuffle(subset.begin(), subset.end(), rng_);
+      subset.resize(kScoreSamples);
+    }
+    const float scale = static_cast<float>(remaining) / static_cast<float>(subset.size());
+
+    auto score = [&](const cv::Vec4f & pl) {
+        int count = 0;
+        for (const int32_t i : subset) {
+          count += isInlier(pl, samples_[static_cast<size_t>(i)]) ? 1 : 0;
+        }
+        return count;
+      };
+
+    cv::Vec4f best;
+    int best_count = 0;
+    // last frame's planes first: keeps the result stable from frame to frame
+    for (const auto & pl : planes_) {
+      const int c = score(pl);
+      if (c > best_count) {
+        best_count = c;
+        best = pl;
+      }
+    }
+    for (int it = 0; it < params_.snap_iterations; ++it) {
+      const int i0 = pick_sample(rng_);
+      if (sample_used_[static_cast<size_t>(i0)]) {
+        continue;
+      }
+      const cv::Vec3f & a = samples_[static_cast<size_t>(i0)];
+      const int gx0 = sample_cell_[static_cast<size_t>(i0)] % gw;
+      const int gy0 = sample_cell_[static_cast<size_t>(i0)] / gw;
+      int32_t idx[2];
+      int got = 0;
+      for (int tries = 0; tries < 8 && got < 2; ++tries) {
+        const int gx = gx0 + pick_offset(rng_);
+        const int gy = gy0 + pick_offset(rng_);
+        if (gx < 0 || gy < 0 || gx >= gw || gy >= gh) {
+          continue;
+        }
+        const int32_t j = sample_grid_[static_cast<size_t>(gy * gw + gx)];
+        if (j >= 0 && j != i0 && !sample_used_[static_cast<size_t>(j)] && (got == 0 || j != idx[0])) {
+          idx[got++] = j;
+        }
+      }
+      cv::Vec4f pl;
+      if (got < 2 ||
+        !planeFrom3(a, samples_[static_cast<size_t>(idx[0])], samples_[static_cast<size_t>(idx[1])], pl))
+      {
+        continue;
+      }
+      const int c = score(pl);
+      if (c > best_count) {
+        best_count = c;
+        best = pl;
+      }
+    }
+    if (static_cast<float>(best_count) * scale < static_cast<float>(min_inliers)) {
+      break;
+    }
+
+    // refine on every remaining inlier, then claim the inliers of the refined plane
+    for (int pass = 0; pass < 2; ++pass) {
+      inliers.clear();
+      for (int i = 0; i < n; ++i) {
+        const auto & p = samples_[static_cast<size_t>(i)];
+        if (!sample_used_[static_cast<size_t>(i)] && isInlier(best, p)) {
+          inliers.push_back(p);
+        }
+      }
+      if (!fitPlane(inliers, best)) {
+        break;
+      }
+    }
+    int claimed = 0;
+    for (int i = 0; i < n; ++i) {
+      if (!sample_used_[static_cast<size_t>(i)] && isInlier(best, samples_[static_cast<size_t>(i)])) {
+        sample_used_[static_cast<size_t>(i)] = 1;
+        ++claimed;
+      }
+    }
+    if (claimed < min_inliers) {
+      break;
+    }
+    // A near-parallel, slightly offset copy of a plane already found is the same
+    // surface bending beyond tol (stereo waviness, panels): snapping parts of it to
+    // different copies would cut steps into it, so claim its samples but drop it.
+    const bool duplicate = std::any_of(
+      found.begin(), found.end(), [&best](const cv::Vec4f & f) {
+        const float dot = f[0] * best[0] + f[1] * best[1] + f[2] * best[2];
+        const float offset = std::fabs(dot > 0.0f ? f[3] - best[3] : f[3] + best[3]);
+        return std::fabs(dot) > kSnapParallelCos && offset < kSnapDuplicateOffset;
+      });
+    if (!duplicate) {
+      found.push_back(best);
+    }
+  }
+  planes_ = found;
+  if (found.empty()) {
+    return;
+  }
+
+  // 2. move each pixel onto the nearest plane along its ray, if within tolerance
+  cv::parallel_for_(
+    cv::Range(0, rows), [&](const cv::Range & range) {
+      for (int y = range.start; y < range.end; ++y) {
+        float * row = work_.ptr<float>(y);
+        const float ry = ray_y_[static_cast<size_t>(y)];
+        for (int x = 0; x < cols; ++x) {
+          const float z = row[x];
+          if (!std::isfinite(z)) {
+            continue;
+          }
+          const float rx = ray_x_[static_cast<size_t>(x)];
+          const float tol = toleranceAt(z, base, quad);
+          float best_z = z;
+          float best_diff = tol;
+          for (const auto & pl : found) {
+            const float denom = pl[0] * rx + pl[1] * ry + pl[2];
+            // grazing rays: a tiny depth error means a large jump along the plane
+            if (std::fabs(denom) < 0.2f) {
+              continue;
+            }
+            const float zp = -pl[3] / denom;
+            const float diff = std::fabs(zp - z);
+            if (zp > 0.0f && diff < best_diff) {
+              best_diff = diff;
+              best_z = zp;
+            }
+          }
+          if (best_z != z) {
+            // Soft blend: full snap near the plane, fading to none at tol, so the
+            // tolerance boundary does not leave a step of height tol.
+            const float t = best_diff / tol;
+            row[x] = z + (1.0f - t * t) * (best_z - z);
+          }
+        }
+      }
+    });
 }
 
 }  // namespace hma_pcl_reconst2

@@ -1,250 +1,119 @@
 # hma_pcl_reconst2
 
-A ROS 2 (Jazzy) package that builds an XYZRGB `PointCloud2` from an RGB image, a depth image, and camera info.
-Input images can be raw, or `compressed` / `compressedDepth` via `image_transport`.
-The output point cloud can be published as a raw `PointCloud2`, or through a compressed `point_cloud_transport` transport.
+ROS 2 (Jazzy) package that builds an organized XYZRGB `PointCloud2` from a registered RGB image,
+a depth image, and camera info. It can optionally denoise active-stereo depth first.
 
-The package provides:
+- `hma_pcl_reconst2::PointCloudXyzrgb`: composable node (raw or `compressed`/`compressedDepth` input,
+  raw or `point_cloud_transport` output)
+- `hma_pcl_reconst2/depth_denoise.hpp`: depth denoiser for active-stereo sensors
+- `pcl_transport_viewer`: decompresses a compressed cloud and republishes it raw
+- `hma_pcl_reconst2/pcl_transport_decompressor.hpp`: header-only helper for subscribing to compressed clouds
 
-- `hma_pcl_reconst2::PointCloudXyzrgb`: a composable node that reconstructs the point cloud
-- `hma_pcl_reconst2/depth_denoise.hpp`: an optional depth-image denoiser for active-stereo sensors
-- `pcl_transport_viewer`: a node that decompresses a compressed point cloud and republishes it as a raw one
-- `hma_pcl_reconst2/pcl_transport_decompressor.hpp`: a header-only helper for subscribing to compressed point clouds from C++
-
-## Install
-
-Install the dependencies:
+## Build
 
 ```bash
-sudo apt install \
-  ros-jazzy-image-transport \
-  ros-jazzy-compressed-image-transport \
-  ros-jazzy-compressed-depth-image-transport \
-  ros-jazzy-point-cloud-transport \
-  ros-jazzy-zstd-point-cloud-transport
-```
-
-To check that the `zstd` transport is available, run:
-
-```bash
-ros2 pkg prefix zstd_point_cloud_transport
-```
-
-Build:
-
-```bash
-cd /hsr_ros2_ws
+sudo apt install ros-jazzy-{image-transport,compressed-image-transport,compressed-depth-image-transport,point-cloud-transport,zstd-point-cloud-transport}
 colcon build --packages-select hma_pcl_reconst2 --symlink-install
-source install/setup.bash
 ```
 
 ## Usage
 
-### Raw image input, raw point cloud output
-
 ```bash
+# HSR (real-robot topics; use_sim_time:=true or USE_SIM_TIME=true for the simulator)
+ros2 launch hma_pcl_reconst2 pcl_reconst.launch.py
+
+# other cameras
 ros2 launch hma_pcl_reconst2 pcl_reconst.launch.py \
   topic_rgb:=/camera/color/image_raw \
   topic_depth:=/camera/aligned_depth_to_color/image_raw \
   topic_camera_info:=/camera/color/camera_info
-```
+  # + use_compressed:=true             subscribe compressed / compressedDepth (pass the base topic)
+  # + use_pointcloud_compressed:=true  publish on <output_topic>/zstd
+  # + denoise:=true                    for active-stereo sensors (RealSense, Orbbec Gemini)
 
-### Compressed image input
+# Orbbec Gemini 336: OrbbecSDK_ROS2 (v2-main) driver + pcl_reconst with denoise:=true
+ros2 launch hma_pcl_reconst2 gemini336.launch.py rviz:=true
 
-```bash
-ros2 launch hma_pcl_reconst2 pcl_reconst.launch.py \
-  topic_rgb:=/camera/color/image_raw \
-  topic_depth:=/camera/aligned_depth_to_color/image_raw \
-  topic_camera_info:=/camera/color/camera_info \
-  use_compressed:=true
-```
-
-With `use_compressed:=true`, the RGB image is subscribed with the `compressed` transport and the depth image with `compressedDepth`. Pass the base topic, without the transport suffix.
-
-### Compressed point cloud output
-
-```bash
-ros2 launch hma_pcl_reconst2 pcl_reconst.launch.py \
-  topic_rgb:=/camera/color/image_raw \
-  topic_depth:=/camera/aligned_depth_to_color/image_raw \
-  topic_camera_info:=/camera/color/camera_info \
-  use_compressed:=true \
-  use_pointcloud_compressed:=true
-```
-
-The compressed cloud is published on `<output_topic>/<compressed_transport>`, which is `/hma_pcl_reconst/depth_registered/points/zstd` by default.
-
-### Denoising an active-stereo depth image
-
-```bash
-ros2 launch hma_pcl_reconst2 pcl_reconst.launch.py denoise:=true
-```
-
-Active-stereo sensors such as the RealSense and the Orbbec Gemini produce visibly
-noisy planes, unlike ToF or structured-light sensors such as the Xtion. Stereo
-triangulates `z = f*b/d`, so the depth error grows with the square of the range:
-
-```
-sigma_z(z) = z^2 * sigma_d / (f * b)
-```
-
-For a Gemini 336L (`b` ~= 0.095 m, `f` ~= 640 px, `sigma_d` ~= 0.15 px) that is about
-2.5 mm at 1 m but 25 cm at 10 m. Every threshold in the denoiser therefore has the
-form `base + quad * z^2`, where the quadratic coefficient is the standard deviation
-expressed in inverse depth (1/m) — equivalently, a constant sigma in disparity space.
-A fixed threshold cannot serve a 0.3-10 m range: tuned for the near field it shreds
-distant surfaces, tuned for the far field it destroys near geometry.
-
-With `denoise:=false` (the default) the depth image is passed through untouched, so
-ToF sensors are unaffected.
-
-The four stages run in this order, and each can be switched off on its own:
-
-1. **Range clip** — drops depth outside `[min_depth, max_depth]`.
-2. **Speckle removal** — builds depth-continuous connected components (8-connected,
-   with the depth-dependent tolerance above) and deletes those below
-   `speckle.max_size` pixels. This is what removes flying pixels.
-3. **Bilateral smoothing** — NaN-aware, so holes are never filled in and never bleed
-   into their surroundings. This is the main fix for noisy planes.
-4. **Temporal EMA** — stereo noise is nearly uncorrelated between frames, so this is
-   the strongest lever at long range. A depth-dependent gate keeps moving objects
-   from ghosting.
-
-Measured on synthetic Gemini-336L-like data (plane RMS, 5x5 window, defaults):
-
-| Scene | Before | After |
-| --- | --- | --- |
-| Plane at 1 m + 3 % speckle | 85.7 mm | 0.7 mm |
-| Plane at 5 m + 3 % speckle | 105.7 mm | 24.5 mm |
-| Plane at 10 m | 259.6 mm | 127.6 mm |
-| Plane at 10 m, 10 frames of EMA | 246.2 mm | 58.7 mm |
-| Plane at 10 m with 40 % dropout | 246.4 mm | 117.0 mm (0.1 pt of pixels lost) |
-
-A 2.00 m / 2.50 m step edge stays sharp, with no pixels pulled across it.
-
-Cost, all four stages, on a 20-core machine: about 15 ms per frame at 1280x720,
-7 ms at 848x480 and 5 ms at 640x480.
-
-### Simulation (`use_sim_time`)
-
-`pcl_reconst.launch.py` picks its default input topics based on `use_sim_time`.
-
-- The `use_sim_time` argument defaults to the `USE_SIM_TIME` environment variable. The values `true`, `1`, `yes`, and `on` enable it.
-- With `use_sim_time:=true`, the node subscribes to the simulator topics (`hsrb_gazebo_bringup`). Otherwise, it subscribes to the real robot topics.
-- Only the input topics change. To subscribe to compressed images, you still have to set `use_compressed:=true`.
-
-```bash
-USE_SIM_TIME=true ros2 launch hma_pcl_reconst2 pcl_reconst.launch.py
-# or
-ros2 launch hma_pcl_reconst2 pcl_reconst.launch.py use_sim_time:=true
-```
-
-| `use_sim_time` | `topic_rgb`                              | `topic_depth`                                       | `topic_camera_info`                 |
-| -------------- | ---------------------------------------- | --------------------------------------------------- | ----------------------------------- |
-| `true`         | `/head_rgbd_sensor/rgb/image_rect_raw`   | `/head_rgbd_sensor/depth_registered/image_rect_raw` | `/head_rgbd_sensor/rgb/camera_info` |
-| `false`        | `/head_rgbd_sensor/rgb/image_rect_color` | `/head_rgbd_sensor/depth_registered/image_rect_raw` | `/head_rgbd_sensor/rgb/camera_info` |
-
-You can still override any of these on the command line, for example with `topic_rgb:=...`.
-
-### Viewing a compressed point cloud
-
-To decompress the point cloud and view it in RViz or another tool:
-
-```bash
+# decompress <output_topic>/zstd for RViz (republished on .../zstd_decompressed)
 ros2 launch hma_pcl_reconst2 pcl_transport_viewer.launch.py
 ```
 
-By default, the viewer subscribes to `/hma_pcl_reconst/depth_registered/points/zstd`
-and republishes the decompressed raw `PointCloud2` on `/hma_pcl_reconst/depth_registered/points/zstd_decompressed`.
-The viewer also accepts a `use_sim_time` argument, which defaults to the `USE_SIM_TIME` environment variable. It does not change the viewer's topics.
+`use_sim_time` switches the default RGB input between `/head_rgbd_sensor/rgb/image_rect_raw` (simulator)
+and `/head_rgbd_sensor/rgb/image_rect_color` (real robot). Depth is `/head_rgbd_sensor/depth_registered/image_rect_raw`
+in both. Explicit `topic_*` arguments always win.
 
-## Parameters
+`gemini336.launch.py` registers depth to color and turns the camera's own post filters off. Its resolution defaults
+to 1280x720 (change it with `color_width:=848` and the other size arguments). It also accepts every `denoise_*` argument below.
 
-### `pcl_reconst.launch.py`
+## Denoising (`denoise:=true`)
 
-| Name                        | Default                                             | Description                                                     |
-| --------------------------- | --------------------------------------------------- | --------------------------------------------------------------- |
-| `topic_rgb`                 | `/head_rgbd_sensor/rgb/image_rect_color`            | RGB image base topic                                            |
-| `topic_depth`               | `/head_rgbd_sensor/depth_registered/image_rect_raw` | Depth image base topic                                          |
-| `topic_camera_info`         | `/head_rgbd_sensor/rgb/camera_info`                 | Camera info topic                                               |
-| `output_topic`              | `/hma_pcl_reconst/depth_registered/points`          | Output point cloud base topic                                   |
-| `use_compressed`            | `false`                                             | Subscribe to RGB as `compressed` and depth as `compressedDepth` |
-| `use_pointcloud_compressed` | `false`                                             | Publish through `point_cloud_transport`                         |
-| `compressed_transport`      | `zstd`                                              | Point cloud transport name                                      |
-| `queue_size`                | `5`                                                 | Sync queue size                                                 |
-| `exact_sync`                | `false`                                             | Use exact timestamp sync instead of approximate sync            |
-| `denoise`                   | `false`                                             | Denoise the depth image before reprojecting it                  |
-| `denoise_clip_min_depth`    | node default (`0.3`)                                | [m] Discard depth below this                                    |
-| `denoise_clip_max_depth`    | node default (`10.0`)                               | [m] Discard depth above this                                    |
-| `denoise_speckle_max_size`  | node default (`200`)                                | [px] Drop connected components smaller than this                |
-| `denoise_speckle_diff_quad` | node default (`0.011`)                              | [1/m] z² term of the speckle connectivity tolerance             |
-| `denoise_bilateral_radius`  | node default (`2`)                                  | Bilateral window radius; `2` is 5x5, `0` disables the stage     |
-| `denoise_bilateral_sigma_quad` | node default (`0.004`)                           | [1/m] z² term of the bilateral range sigma                      |
-| `denoise_temporal_alpha`    | node default (`0.5`)                                | Weight of the new frame in the temporal EMA; `0` disables it    |
-| `use_sim_time`              | `$USE_SIM_TIME` (`false` if unset)                  | Use the simulation clock and the simulation input topics        |
+Stereo depth error grows with the square of the range (`sigma_z = z^2 * sigma_d / (f * b)`),
+so every threshold is `base + quad * z^2`. With `denoise:=false` the depth passes through untouched,
+which is the right choice for ToF sensors such as the Xtion. The stages run in this order:
 
-The `denoise_*` tuning arguments are left out of the node's parameters when unset, so
-the node's own defaults apply. Every denoise parameter is also settable directly, under
-the dotted names `denoise.enable`, `denoise.clip.*`, `denoise.speckle.*`,
-`denoise.bilateral.*` and `denoise.temporal.*` — see `DepthDenoiser::declareParameters`
-in `src/depth_denoise.cpp` for the full list, including the per-stage `enable` flags.
+1. **Clip**: drops depth outside `[min_depth, max_depth]`.
+2. **Speckle**: drops small depth-continuous components (flying pixels).
+3. **Bilateral**: NaN-aware edge-preserving smoothing. Removes the pixel-level grain.
+4. **Temporal**: EMA with a motion gate.
+5. **Plane snap**: RANSAC finds the dominant planes. Pixels within `tol(z)` of a plane are pulled onto it
+   along their ray, with a soft blend. This removes the low-frequency waviness that local filters cannot.
+   Anything thinner than `tol` lying on a plane gets flattened.
 
-The defaults of `topic_rgb`, `topic_depth`, and `topic_camera_info` depend on `use_sim_time` (see [Simulation](#simulation-use_sim_time)).
-The table shows the values for the real robot (`use_sim_time:=false`).
+Plane RMS on a live Gemini 336 at 1280x720:
 
-### `pcl_transport_viewer.launch.py`
+| | floor 0.8 m | wall 1.9 m |
+| --- | --- | --- |
+| raw | 1.75 mm | 16.1 mm |
+| stages 1-4 | 1.55 mm | 14.2 mm |
+| + snap, `diff_quad` 0.008 (default) | 1.13 mm | 10.0 mm |
+| + snap, `diff_quad` 0.012 | 0.97 mm | 5.7 mm |
 
-| Name               | Default                                                      | Description                                            |
-| ------------------ | ------------------------------------------------------------ | ------------------------------------------------------ |
-| `input_topic`      | `/hma_pcl_reconst/depth_registered/points/zstd`              | Compressed transport topic, or the base topic          |
-| `output_topic`     | `/hma_pcl_reconst/depth_registered/points/zstd_decompressed` | Raw `PointCloud2` topic for the decompressed clouds    |
-| `transport`        | `zstd`                                                       | `point_cloud_transport` subscriber transport           |
-| `republish`        | `true`                                                       | Republish the decompressed clouds as raw `PointCloud2` |
-| `log_interval_sec` | `1.0`                                                        | Interval between terminal status logs, in seconds      |
-| `use_sim_time`     | `$USE_SIM_TIME` (`false` if unset)                           | Use the simulation clock                               |
+Cost on a 20-core PC: denoise about 14 ms (bilateral 7, snap 4), reprojection 5 ms, publish 11 ms.
+That is about 30 Hz, with about 110 ms from the sensor stamp to publish.
 
-## C++ Decompressor Helper
+Every `denoise.*` node parameter can be changed at runtime (`ros2 param set /pcl_reconst ...` or `rqt_reconfigure`).
+The full list is in `DepthDenoiser::declareParameters` (`src/depth_denoise.cpp`).
 
-`pcl_transport_decompressor.hpp` lets other nodes subscribe to a compressed `point_cloud_transport` point cloud with a few lines of code:
+## Parameters (`pcl_reconst.launch.py`)
+
+| Name | Default | Description |
+| --- | --- | --- |
+| `topic_rgb` / `topic_depth` / `topic_camera_info` | HSR topics (see above) | Inputs. RGB and depth must be registered |
+| `output_topic` | `/hma_pcl_reconst/depth_registered/points` | Output base topic |
+| `use_compressed` | `false` | Subscribe `compressed` / `compressedDepth` |
+| `use_pointcloud_compressed` / `compressed_transport` | `false` / `zstd` | Publish through `point_cloud_transport` |
+| `queue_size` / `exact_sync` | `5` / `false` | RGB-depth synchronizer |
+| `use_sim_time` | `$USE_SIM_TIME` | Simulation clock and simulator topics |
+| `denoise` | `false` | Enable the denoiser |
+| `denoise_bilateral_radius` / `denoise_bilateral_sigma_quad` | `2` / `0.004` | Bilateral window radius and range-sigma z² term [1/m] |
+| `denoise_snap` / `denoise_snap_diff_quad` | `true` / `0.008` | Plane snap and its tolerance z² term [1/m] (about 9 mm at 0.8 m) |
+| `denoise_num_threads` | `0` | OpenCV thread count (process-global); `0` leaves it alone |
+| `denoise_clip_{min,max}_depth`, `denoise_speckle_{max_size,diff_quad}`, `denoise_temporal_alpha` | node default | Passed only when set |
+
+Node-only parameter: `input_queue_depth` (default `1`: always process the newest frame, for the lowest latency).
+
+`pcl_transport_viewer.launch.py` takes `input_topic`, `output_topic`, `transport` (`zstd`), `republish` (`true`),
+`log_interval_sec` (`1.0`), and `use_sim_time`.
+
+## C++ decompressor helper
 
 ```cpp
 #include "hma_pcl_reconst2/pcl_transport_decompressor.hpp"
 
-auto decompressor =
-  std::make_unique<hma_pcl_reconst2::PointCloudTransportDecompressor>(
-    node,
-    "/hma_pcl_reconst/depth_registered/points/zstd",
-    "zstd",
-    rclcpp::SensorDataQoS(),
-    [](const sensor_msgs::msg::PointCloud2::ConstSharedPtr & msg) {
-      // msg is already a decompressed PointCloud2.
-    });
+auto decompressor = std::make_unique<hma_pcl_reconst2::PointCloudTransportDecompressor>(
+  node, "/hma_pcl_reconst/depth_registered/points/zstd", "zstd", rclcpp::SensorDataQoS(),
+  [](const sensor_msgs::msg::PointCloud2::ConstSharedPtr & msg) { /* already decompressed */ });
 ```
-
-`input_topic` accepts either the base topic or a topic with a transport suffix such as `/zstd`.
 
 ## Notes
 
-- The RGB and depth topics must have the same resolution and the same frame, that is, the depth image must be registered to the RGB image.
-  On a RealSense camera, `/camera/aligned_depth_to_color/image_raw` is a suitable depth topic.
-- `denoise:=true` is for active-stereo sensors. ToF and structured-light sensors such
-  as the Xtion do not need it; leave it at the default.
-- Set `denoise_clip_max_depth` comfortably beyond the furthest surface you care about.
-  A surface sitting exactly on the limit loses roughly half its pixels to the clip,
-  because its noise straddles the threshold.
-- If distant surfaces disappear when denoising is on, the speckle tolerance is too
-  tight for the noise at that range: raise `denoise_speckle_diff_quad`, or lower
-  `denoise_speckle_max_size`.
-- 16UC1 depth input is assumed to be 1 count = 1 mm (see `depth_traits.hpp`). Orbbec
-  drivers can be configured with a different depth unit; at a 0.1 mm unit a 10 m
-  reading overflows uint16 and the scale is wrong regardless of denoising.
-- A 1280x720 organized XYZRGB point cloud is about 29.5 MB per frame when raw.
-  To reach 30 Hz, consider lowering the resolution or the number of points as well as compressing the cloud.
+- The output point is packed into 16 bytes (`x`, `y`, `z`, `rgb` as FLOAT32). A raw 1280x720 cloud is about 14.7 MB.
+- 16UC1 depth is read as 1 count = 1 mm.
+- If distant surfaces vanish with denoising on, raise `denoise_speckle_diff_quad`. Keep `denoise_clip_max_depth`
+  well beyond the furthest surface you care about.
+- Gemini 336 with old firmware: if the driver fails with `propertyId: 2052 status:1005`, update the firmware
+  to 1.8.10 or guard the auto-exposure-priority readback in `ob_camera_node.cpp`.
 
-## Author
+## Author / License
 
-- Ryohei Kobayashi (<kobayashi.ryohei621@mail.kyutech.jp>)
-
-## License
-
-This package is licensed under the [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0).
+Ryohei Kobayashi (<kobayashi.ryohei621@mail.kyutech.jp>), [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0)

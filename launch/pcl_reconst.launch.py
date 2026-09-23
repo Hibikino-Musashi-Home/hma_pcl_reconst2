@@ -36,11 +36,14 @@ def launch_setup(context):
     use_pointcloud_compressed = LaunchConfiguration(
         'use_pointcloud_compressed')
 
-    # Tuning arguments default to '' and are simply left out when unset, so the
-    # node's own defaults stay the single source of truth for them.
+    # Tuning arguments left at '' are simply not passed, so the node's own default
+    # applies. The ones with a value are tuned for active-stereo sensors (a live
+    # Gemini 336, floor at 0.8 m, wall at 1.9 m) and only matter with denoise:=true.
     denoise_params = {
         'denoise.enable': ParameterValue(
             LaunchConfiguration('denoise'), value_type=bool),
+        'denoise.snap.enable': ParameterValue(
+            LaunchConfiguration('denoise_snap'), value_type=bool),
     }
     tuning = {
         'denoise.clip.min_depth': float,
@@ -50,6 +53,8 @@ def launch_setup(context):
         'denoise.bilateral.radius': int,
         'denoise.bilateral.sigma_quad': float,
         'denoise.temporal.alpha': float,
+        'denoise.snap.diff_quad': float,
+        'denoise.num_threads': int,
     }
     for name, value_type in tuning.items():
         arg = name.replace('.', '_')
@@ -155,17 +160,32 @@ def generate_launch_description():
                         'distant surfaces are being deleted.',
         ),
         DeclareLaunchArgument(
-            'denoise_bilateral_radius', default_value='',
+            'denoise_bilateral_radius', default_value='2',
             description='Bilateral window radius (2 => 5x5). 0 disables the stage.',
         ),
         DeclareLaunchArgument(
-            'denoise_bilateral_sigma_quad', default_value='',
+            'denoise_bilateral_sigma_quad', default_value='0.004',
             description='[1/m] z^2 term of the bilateral range sigma, i.e. the sigma in '
                         'inverse-depth space. The main knob for flattening planes.',
         ),
         DeclareLaunchArgument(
             'denoise_temporal_alpha', default_value='',
             description='Weight of the new frame in the temporal EMA. 0 disables it.',
+        ),
+        DeclareLaunchArgument(
+            'denoise_snap_diff_quad', default_value='0.008',
+            description='[1/m] z^2 term of the plane snap tolerance (~9 mm at 0.8 m). Larger '
+                        'flattens planes more but also flattens thicker objects lying on them.',
+        ),
+        DeclareLaunchArgument(
+            'denoise_num_threads', default_value='0',
+            description='OpenCV thread count (process-global). 0 leaves it alone.',
+        ),
+        DeclareLaunchArgument(
+            'denoise_snap', default_value='true',
+            description='Snap pixels close to a dominant plane onto it (removes the '
+                        'low-frequency waviness of stereo depth; flattens anything thinner '
+                        'than the snap tolerance lying on a plane).',
         ),
         OpaqueFunction(function=launch_setup),
     ])

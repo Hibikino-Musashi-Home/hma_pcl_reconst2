@@ -22,6 +22,8 @@
   <exec_depend>compressed_image_transport</exec_depend>
   <exec_depend>compressed_depth_image_transport</exec_depend>
   <exec_depend>zstd_point_cloud_transport</exec_depend>
+  <!-- gemini336_denoise_debug.launch.py only; build OrbbecSDK_ROS2 in additional_pkg -->
+  <exec_depend>rviz2</exec_depend>
 
   <export>
     <build_type>ament_cmake</build_type>
